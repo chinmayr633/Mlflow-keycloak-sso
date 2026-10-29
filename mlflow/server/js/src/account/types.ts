@@ -1,6 +1,7 @@
 export interface User {
   id: number;
   username: string;
+  display_name?: string | null;
   is_admin: boolean;
   /**
    * Roles the requester is authorized to see for this user. The backend
@@ -36,6 +37,7 @@ export interface UserResponse {
    * change-password modal).
    */
   is_basic_auth?: boolean;
+  is_keycloak_auth?: boolean;
 }
 
 export interface ListUserRolesResponse {

@@ -45,6 +45,7 @@ const UsersTab = () => {
   const { data: usersData, isLoading: usersLoading, error: queryError } = useUsersQuery();
   const { data: currentUserData, isLoading: currentUserLoading } = useCurrentUserQuery();
   const currentUsername = currentUserData?.user?.username;
+  const isKeycloakAuth = Boolean(currentUserData?.is_keycloak_auth);
   // Block render until ``currentUsername`` is known: otherwise ``isSelf``
   // would be ``false`` for every row while the query is in-flight, leaving
   // a window where a fast "Select all" + Delete click would include the
@@ -60,7 +61,8 @@ const UsersTab = () => {
   // their own row (the backend self-check returns global roles).
   const isAdmin = useCurrentUserIsAdmin();
   const isWorkspaceAdmin = useCurrentUserIsWorkspaceAdmin();
-  const canCreateUser = isAdmin || isWorkspaceAdmin;
+  const canCreateUser = !isKeycloakAuth && (isAdmin || isWorkspaceAdmin);
+  const canDeleteUsers = !isKeycloakAuth && isAdmin;
   const activeWorkspace = useActiveWorkspace();
   const rolesScopeWorkspace = isAdmin ? null : activeWorkspace;
 
@@ -129,10 +131,17 @@ const UsersTab = () => {
       <Empty
         title={<FormattedMessage defaultMessage="No users" description="Empty state title for users table" />}
         description={
-          <FormattedMessage
-            defaultMessage="Create a user to get started."
-            description="Empty state description for users table"
-          />
+          isKeycloakAuth ? (
+            <FormattedMessage
+              defaultMessage="Users appear here after signing in with Keycloak."
+              description="Empty state for Keycloak-managed users"
+            />
+          ) : (
+            <FormattedMessage
+              defaultMessage="Create a user to get started."
+              description="Empty state description for users table"
+            />
+          )
         }
       />
     ) : null;
@@ -151,7 +160,7 @@ const UsersTab = () => {
             gap: theme.spacing.sm,
           }}
         >
-          {isAdmin && (
+          {canDeleteUsers && (
             <Button
               componentId="admin.users.bulk_delete_button"
               danger
@@ -188,7 +197,7 @@ const UsersTab = () => {
         }}
       >
         <TableRow isHeader>
-          {isAdmin && (
+          {canDeleteUsers && (
             <TableHeader componentId="admin.users.select_header" css={{ flex: 0, minWidth: 40, maxWidth: 40 }}>
               <Checkbox
                 componentId="admin.users.select_all"
@@ -224,7 +233,7 @@ const UsersTab = () => {
           );
           return (
             <TableRow key={user.username}>
-              {isAdmin && (
+              {canDeleteUsers && (
                 <TableCell css={{ flex: 0, minWidth: 40, maxWidth: 40 }}>
                   {isSelf ? (
                     <Tooltip
@@ -248,7 +257,7 @@ const UsersTab = () => {
                   componentId="admin.users.username_link"
                   to={withReturnTo(AdminRoutes.getUserDetailRoute(user.username))}
                 >
-                  {user.username}
+                  {user.display_name || user.username}
                 </Link>
               </TableCell>
               <TableCell css={{ flex: 2 }}>

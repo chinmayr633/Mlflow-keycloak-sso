@@ -385,8 +385,13 @@ def _bootstrap_basic_auth() -> None:
     """
     # `mlflow.server.auth` requires the optional `auth` extra, so only import it when needed.
     from mlflow.server.auth import bootstrap_admin_user, get_flask_server_secret_key
+    from mlflow.server.auth import auth_config
 
     get_flask_server_secret_key()
+    if auth_config.authorization_function == "mlflow.server.auth.keycloak:authenticate_request":
+        from mlflow.server.auth.keycloak import get_config
+
+        get_config()
     bootstrap_admin_user()
 
 

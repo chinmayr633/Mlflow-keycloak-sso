@@ -5141,6 +5141,7 @@ aliyun-oss = [
 ]
 auth = [
     { name = "flask-wtf" },
+    { name = "pyjwt", extra = ["crypto"] },
 ]
 azure = [
     { name = "azure-identity" },
@@ -5392,6 +5393,7 @@ requires-dist = [
     { name = "pyarrow", specifier = ">=4.0.0,<27" },
     { name = "pyarrow", marker = "extra == 'extras'" },
     { name = "pydantic", specifier = ">=2.0.0,<3" },
+    { name = "pyjwt", extras = ["crypto"], marker = "extra == 'auth'", specifier = ">=2.8.0,<3" },
     { name = "pymssql", marker = "extra == 'db'" },
     { name = "pymysql", marker = "extra == 'db'" },
     { name = "pysftp", marker = "extra == 'extras'" },

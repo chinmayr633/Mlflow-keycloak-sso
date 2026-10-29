@@ -122,7 +122,7 @@ aliyun-oss = ["aliyunstoreplugin"]
 jfrog = ["mlflow-jfrog-plugin"]
 kubernetes = ["kubernetes"]
 langchain = ["langchain>=1.0.0,<=1.4.3"]
-auth = ["Flask-WTF<2"]
+auth = ["Flask-WTF<2", "PyJWT[crypto]<3,>=2.8.0"]
 
 [project.urls]
 homepage = "https://mlflow.org"
@@ -151,6 +151,7 @@ mlflow = [
   "temporary_db_migrations_for_pre_1_users/alembic.ini",
   "pyspark/ml/log_model_allowlist.txt",
   "server/auth/basic_auth.ini",
+  "server/auth/keycloak_auth.ini",
   "server/auth/db/migrations/alembic.ini",
   "server/uvicorn_log_config.yaml",
   "models/notebook_resources/**/*",

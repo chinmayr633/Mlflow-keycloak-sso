@@ -72,8 +72,14 @@ class SecurityHeadersMiddleware:
 
         async def send_wrapper(message):
             if message["type"] == "http.response.start":
-                headers = dict(message.get("headers", []))
-                headers[b"x-content-type-options"] = b"nosniff"
+                # ASGI headers are a list because responses can contain multiple
+                # Set-Cookie headers. Converting to a dict drops all but the last.
+                headers = [
+                    (name, value)
+                    for name, value in message.get("headers", [])
+                    if name.lower() != b"x-content-type-options"
+                ]
+                headers.append((b"x-content-type-options", b"nosniff"))
 
                 # Skip X-Frame-Options for notebook renderer to allow iframe embedding in notebooks
                 path = scope.get("path", "")
@@ -84,7 +90,12 @@ class SecurityHeadersMiddleware:
                     and self.x_frame_options.upper() != "NONE"
                     and not is_notebook_renderer
                 ):
-                    headers[b"x-frame-options"] = self.x_frame_options.upper().encode()
+                    headers = [
+                        (name, value)
+                        for name, value in headers
+                        if name.lower() != b"x-frame-options"
+                    ]
+                    headers.append((b"x-frame-options", self.x_frame_options.upper().encode()))
 
                 if (
                     scope["method"] == "OPTIONS"
@@ -93,7 +104,7 @@ class SecurityHeadersMiddleware:
                 ):
                     message["status"] = HTTPStatus.NO_CONTENT
 
-                message["headers"] = list(headers.items())
+                message["headers"] = headers
             await send(message)
 
         await self.app(scope, receive, send_wrapper)

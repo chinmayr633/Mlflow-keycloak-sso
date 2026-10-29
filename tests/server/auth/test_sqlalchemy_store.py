@@ -28,6 +28,18 @@ def _user_maker(store, username, password, is_admin=False):
     return store.create_user(username, password, is_admin)
 
 
+def test_user_display_name_persists_without_changing_username(store):
+    user = store.create_user("keycloak:subject", "long-test-password")
+    assert user.display_name is None
+
+    store.update_user("keycloak:subject", display_name="person@example.com")
+    stored = store.get_user("keycloak:subject")
+    assert stored.username == "keycloak:subject"
+    assert stored.display_name == "person@example.com"
+    assert stored.to_json()["display_name"] == "person@example.com"
+    assert store.list_users_with_roles()[0][0].display_name == "person@example.com"
+
+
 def test_create_user(store):
     username1 = random_str()
     password1 = random_str()

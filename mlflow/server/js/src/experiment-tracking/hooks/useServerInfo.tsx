@@ -10,6 +10,7 @@ export const SERVER_INFO_PATH = 'ajax-api/3.0/mlflow/server-info';
 export const getServerInfoUrl = (): string => getAjaxUrl(SERVER_INFO_PATH);
 
 interface ServerInfoResponse {
+  auth_mode?: 'keycloak' | '';
   store_type: string | null;
   workspaces_enabled: boolean;
   trace_archival_enabled: boolean;

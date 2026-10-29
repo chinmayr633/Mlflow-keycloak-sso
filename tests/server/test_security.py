@@ -1,3 +1,4 @@
+import asyncio
 import logging
 
 import pytest
@@ -7,7 +8,7 @@ from starlette.testclient import TestClient
 from werkzeug.test import Client
 
 from mlflow.server import security
-from mlflow.server.fastapi_security import init_fastapi_security
+from mlflow.server.fastapi_security import SecurityHeadersMiddleware, init_fastapi_security
 from mlflow.server.security_utils import (
     is_allowed_host_header,
     is_api_endpoint,
@@ -142,6 +143,38 @@ def test_security_headers(test_app):
     response = client.get("/test")
     assert response.headers.get("X-Content-Type-Options") == "nosniff"
     assert response.headers.get("X-Frame-Options") == "SAMEORIGIN"
+
+
+def test_fastapi_security_preserves_multiple_set_cookie_headers():
+    async def app(scope, receive, send):
+        await send({
+            "type": "http.response.start",
+            "status": 302,
+            "headers": [
+                (b"set-cookie", b"mlflow-keycloak-session=signed; Path=/"),
+                (b"set-cookie", b"session=; Max-Age=0; Path=/"),
+            ],
+        })
+        await send({"type": "http.response.body", "body": b""})
+
+    messages = []
+
+    async def send(message):
+        messages.append(message)
+
+    asyncio.run(
+        SecurityHeadersMiddleware(app)(
+            {"type": "http", "method": "GET", "path": "/oauth/keycloak/callback"},
+            None,
+            send,
+        )
+    )
+    headers = messages[0]["headers"]
+    assert [value for name, value in headers if name == b"set-cookie"] == [
+        b"mlflow-keycloak-session=signed; Path=/",
+        b"session=; Max-Age=0; Path=/",
+    ]
+    assert (b"x-content-type-options", b"nosniff") in headers
 
 
 def test_disable_security_middleware(test_app, monkeypatch: pytest.MonkeyPatch):

@@ -23,6 +23,7 @@ class SqlUser(Base):
     __tablename__ = "users"
     id = Column(Integer(), primary_key=True)
     username = Column(String(255), unique=True)
+    display_name = Column(String(255), nullable=True)
     password_hash = Column(String(255))
     is_admin = Column(Boolean, default=False)
     # Cascade through user_role_assignments so ``session.delete(user)`` cleans
@@ -43,6 +44,7 @@ class SqlUser(Base):
         return User(
             id_=self.id,
             username=self.username,
+            display_name=self.display_name,
             password_hash=self.password_hash,
             is_admin=self.is_admin,
         )

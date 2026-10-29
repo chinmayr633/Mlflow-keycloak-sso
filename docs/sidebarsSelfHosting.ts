@@ -91,6 +91,11 @@ const sidebarsSelfHosting: SidebarsConfig = {
         },
         {
           type: 'doc',
+          id: 'security/keycloak-sso',
+          label: 'Keycloak SSO',
+        },
+        {
+          type: 'doc',
           id: 'security/custom',
           label: 'Custom Authentication',
         },

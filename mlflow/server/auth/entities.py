@@ -10,11 +10,13 @@ class User:
         username,
         password_hash,
         is_admin,
+        display_name=None,
     ):
         self._id = id_
         self._username = username
         self._password_hash = password_hash
         self._is_admin = is_admin
+        self._display_name = display_name
 
     @property
     def id(self):
@@ -29,6 +31,10 @@ class User:
         return self._password_hash
 
     @property
+    def display_name(self):
+        return self._display_name
+
+    @property
     def is_admin(self):
         return self._is_admin
 
@@ -37,11 +43,14 @@ class User:
         self._is_admin = is_admin
 
     def to_json(self):
-        return {
+        result = {
             "id": self.id,
             "username": self.username,
             "is_admin": self.is_admin,
         }
+        if self.display_name is not None:
+            result["display_name"] = self.display_name
+        return result
 
     @classmethod
     def from_json(cls, dictionary):
@@ -50,6 +59,7 @@ class User:
             username=dictionary["username"],
             password_hash="REDACTED",
             is_admin=dictionary["is_admin"],
+            display_name=dictionary.get("display_name"),
         )
 
 

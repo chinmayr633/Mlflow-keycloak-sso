@@ -69,6 +69,7 @@ const AccountPage = () => {
   const updatePassword = useUpdatePassword();
   const { data: currentUserData, isLoading: currentUserLoading } = useCurrentUserQuery();
   const username = currentUserData?.user?.username ?? '';
+  const displayName = currentUserData?.user?.display_name || username;
   const { workspacesEnabled } = useWorkspacesEnabled();
   // Change-password drives the same Basic-Auth realm-cache flow as logout,
   // so hide the affordance under custom authorization_function plugins.
@@ -197,7 +198,7 @@ const AccountPage = () => {
                 defaultMessage="Logged in as <strong>{username}</strong>"
                 description="Subtitle showing the currently authenticated username"
                 values={{
-                  username,
+                  username: displayName,
                   strong: (chunks) => <strong>{chunks}</strong>,
                 }}
               />

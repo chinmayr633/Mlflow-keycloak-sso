@@ -110,10 +110,11 @@ export function MlflowSidebar({
   // the same query, which React Query dedupes but obscures the data flow.
   const { data: currentUserData, isError: currentUserIsError, isLoading: currentUserIsLoading } = useCurrentUserQuery();
   const username = currentUserData?.user?.username ?? '';
+  const displayName = currentUserData?.user?.display_name || username;
   const isAuthAvailable = !currentUserIsError && (currentUserIsLoading || Boolean(currentUserData?.user));
-  // Logout uses an HTTP Basic Auth realm-cache trick that no-ops under
-  // custom ``authorization_function`` deployments, so hide it there.
+  // Basic Auth clears the browser's credential cache; Keycloak uses its logout endpoint.
   const isBasicAuth = useIsBasicAuth();
+  const isKeycloakAuth = Boolean(currentUserData?.is_keycloak_auth);
   const queryClient = useQueryClient();
   const navigate = useNavigate({ bypassWorkspacePrefix: true });
 
@@ -423,7 +424,7 @@ export function MlflowSidebar({
                   */}
                   <button
                     type="button"
-                    aria-label={`Account menu for ${username}`}
+                    aria-label={`Account menu for ${displayName}`}
                     css={{
                       ...getSidebarItemStyles(theme, !showSidebar),
                       background: 'transparent',
@@ -437,7 +438,7 @@ export function MlflowSidebar({
                       },
                     }}
                   >
-                    <Avatar type="user" size="sm" label={username} />
+                    <Avatar type="user" size="sm" label={displayName} />
                     {showSidebar && (
                       <Typography.Text
                         css={{
@@ -448,7 +449,7 @@ export function MlflowSidebar({
                           whiteSpace: 'nowrap',
                         }}
                       >
-                        {username}
+                        {displayName}
                       </Typography.Text>
                     )}
                   </button>
@@ -490,7 +491,7 @@ export function MlflowSidebar({
                       />
                     </DropdownMenu.Item>
                   )}
-                  {isBasicAuth && (
+                  {(isBasicAuth || isKeycloakAuth) && (
                     <>
                       <DropdownMenu.Separator />
                       <DropdownMenu.Item
@@ -498,7 +499,11 @@ export function MlflowSidebar({
                         onPointerDown={() => {
                           accountDropdownClosedByPointerRef.current = true;
                         }}
-                        onClick={() => performLogout(queryClient)}
+                        onClick={() =>
+                          isKeycloakAuth
+                            ? window.location.assign(new URL('oauth/keycloak/logout', document.baseURI).toString())
+                            : performLogout(queryClient)
+                        }
                       >
                         <FormattedMessage defaultMessage="Logout" description="Sidebar logout menu item" />
                       </DropdownMenu.Item>

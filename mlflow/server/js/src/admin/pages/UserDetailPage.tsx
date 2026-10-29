@@ -23,6 +23,7 @@ import AdminRoutes from '../routes';
 import { EditAccessModal } from '../components/EditAccessModal';
 import { PermissionsSection } from '../../account/PermissionsSection';
 import { isSyntheticUserRole, isWorkspaceAdminRole } from '../types';
+import { useCurrentUserQuery } from '../../account/hooks';
 
 const UserDetailPage = () => {
   const { theme } = useDesignSystemTheme();
@@ -40,6 +41,8 @@ const UserDetailPage = () => {
   // ``is_admin`` flag for this user. Failing this should not block the
   // permissions view, so the error is not fatal here.
   const { data: usersData } = useUsersQuery();
+  const { data: currentUserData } = useCurrentUserQuery();
+  const isKeycloakAuth = Boolean(currentUserData?.is_keycloak_auth);
   const { workspacesEnabled } = useWorkspacesEnabled();
   const withReturnTo = useWithSettingsReturnTo();
   // For workspace managers viewing a user outside their workspaces,
@@ -57,6 +60,7 @@ const UserDetailPage = () => {
   const [editAccessOpen, setEditAccessOpen] = useState(false);
 
   const user = useMemo(() => usersData?.users?.find((u) => u.username === username), [usersData, username]);
+  const displayName = user?.display_name || username;
   // Direct grants live on the synthetic ``__user_<id>__`` role surfaced via
   // ``listUserRoles`` alongside regular roles. ``PermissionsSection`` splits
   // them on display (synthetic → "Direct" label, regular → role name), so we
@@ -107,14 +111,14 @@ const UserDetailPage = () => {
               Platform Admin
             </Link>
           </Breadcrumb.Item>
-          <Breadcrumb.Item>{username}</Breadcrumb.Item>
+          <Breadcrumb.Item>{displayName}</Breadcrumb.Item>
         </Breadcrumb>
 
         <div css={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
           <div css={{ display: 'flex', flexDirection: 'column', gap: theme.spacing.xs }}>
             <div css={{ display: 'flex', alignItems: 'center', gap: theme.spacing.sm }}>
               <Typography.Title withoutMargins level={2}>
-                {username}
+                {displayName}
               </Typography.Title>
               {user?.is_admin && (
                 <Tag componentId="admin.user_detail.admin_tag" color="indigo">
@@ -124,13 +128,15 @@ const UserDetailPage = () => {
             </div>
             <Typography.Text color="secondary">Permissions and roles assigned to this user.</Typography.Text>
           </div>
-          <Button
-            componentId="admin.user_detail.edit_access_button"
-            type="primary"
-            onClick={() => setEditAccessOpen(true)}
-          >
-            Edit access
-          </Button>
+          {!isKeycloakAuth && (
+            <Button
+              componentId="admin.user_detail.edit_access_button"
+              type="primary"
+              onClick={() => setEditAccessOpen(true)}
+            >
+              Edit access
+            </Button>
+          )}
         </div>
 
         <Tabs.Root

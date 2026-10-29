@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { LegacySkeleton, useDesignSystemTheme } from '@databricks/design-system';
+import { Button, LegacySkeleton, Typography, useDesignSystemTheme } from '@databricks/design-system';
+import { FormattedMessage } from 'react-intl';
 import { useDocumentTitle } from '@databricks/web-shared/routing';
 
 import ErrorModal from './experiment-tracking/components/modals/ErrorModal';
@@ -22,7 +23,9 @@ import {
   SERVER_FEATURE_KEYS,
   useFeatureEnabled,
   useWorkspacesEnabled,
+  useServerInfo,
 } from './experiment-tracking/hooks/useServerInfo';
+import { useCurrentUserQuery } from './account/hooks';
 
 // Route definition imports:
 import { getRouteDefs as getExperimentTrackingRouteDefs } from './experiment-tracking/route-defs';
@@ -58,6 +61,29 @@ import { useWorkspaces } from './workspaces/hooks/useWorkspaces';
 const LazyDevUserSwitcher = React.lazy(() =>
   import('./admin/DevUserSwitcher').then((m) => ({ default: m.DevUserSwitcher })),
 );
+
+const KeycloakLoginGate = ({ children }: { children: React.ReactNode }) => {
+  const { theme } = useDesignSystemTheme();
+  const { data: serverInfo } = useServerInfo();
+  const { data: currentUser, isLoading } = useCurrentUserQuery();
+  if (serverInfo?.auth_mode !== 'keycloak') return <>{children}</>;
+  if (isLoading) return <LegacySkeleton />;
+  if (currentUser?.user) return <>{children}</>;
+  return (
+    <main css={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+      <div css={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: theme.spacing.lg }}>
+        <Typography.Title level={2}>MLflow</Typography.Title>
+        <Button
+          componentId="mlflow.keycloak.login"
+          type="primary"
+          onClick={() => window.location.assign(new URL('oauth/keycloak/login', document.baseURI).toString())}
+        >
+          <FormattedMessage defaultMessage="Login with Keycloak" description="Keycloak sign-in button" />
+        </Button>
+      </div>
+    </main>
+  );
+};
 
 type MlflowRouteDef = {
   path?: string;
@@ -155,12 +181,14 @@ const MlflowRootRoute = () => {
   }, [isSingleExperimentPage, enableWorkflowBasedNavigation]);
 
   return (
-    <AssistantProvider>
-      <AssistantRouteContextProvider />
-      <WorkflowTypeProvider>
-        <MlflowRootLayout showSidebar={showSidebar} setShowSidebar={setShowSidebar} />
-      </WorkflowTypeProvider>
-    </AssistantProvider>
+    <KeycloakLoginGate>
+      <AssistantProvider>
+        <AssistantRouteContextProvider />
+        <WorkflowTypeProvider>
+          <MlflowRootLayout showSidebar={showSidebar} setShowSidebar={setShowSidebar} />
+        </WorkflowTypeProvider>
+      </AssistantProvider>
+    </KeycloakLoginGate>
   );
 };
 

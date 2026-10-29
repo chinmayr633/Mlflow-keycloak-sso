@@ -7910,6 +7910,14 @@ def build_server_info_payload() -> dict[str, Any]:
             "scheduled_issue_detection": scheduled_issue_detection_enabled,
         },
         SERVER_INFO_TRACKING_AUTH: MLFLOW_SERVER_INFO_TRACKING_AUTH.get() or "",
+        "auth_mode": (
+            "keycloak"
+            if (auth_mod := sys.modules.get("mlflow.server.auth"))
+            and auth_mod.is_auth_enabled()
+            and auth_mod.auth_config.authorization_function
+            == "mlflow.server.auth.keycloak:authenticate_request"
+            else ""
+        ),
         SERVER_INFO_ARTIFACTS_PRESIGNED_ONLY: MLFLOW_ARTIFACTS_PRESIGNED_ONLY.get(),
     }
 

@@ -637,12 +637,24 @@ def is_unprotected_route(path: str) -> bool:
     # prefix before matching: matching the full path would let a prefix that
     # itself starts with an exempt path (e.g. ``/static-ui``) exempt every route.
     bare_path = _strip_static_prefix(path)
+    if auth_config.authorization_function == "mlflow.server.auth.keycloak:authenticate_request":
+        from mlflow.server.auth.keycloak import CALLBACK_PATH, LOGIN_PATH, LOGOUT_PATH
+
+        if bare_path in {"/", LOGIN_PATH, CALLBACK_PATH, LOGOUT_PATH}:
+            return True
     if bare_path.startswith(_UNPROTECTED_PATH_PREFIXES):
         return True
     # Server-info is public, including on a basic-auth server, so a client can read
     # how the server is configured before logging in. Keep the payload free of
     # secrets; see build_server_info_payload.
     return _matches_route_suffix(bare_path, _PUBLIC_ROUTE_SUFFIXES)
+
+
+def _keycloak_manages_user(username: str) -> bool:
+    return (
+        auth_config.authorization_function == "mlflow.server.auth.keycloak:authenticate_request"
+        and username.startswith("keycloak:")
+    )
 
 
 def make_basic_auth_response() -> Response:
@@ -6311,6 +6323,8 @@ def assign_role():
     username = _get_request_param("username")
     role_id = _get_int_request_param("role_id")
     user = store.get_user(username)
+    if _keycloak_manages_user(username) and store.get_role(role_id).name.startswith("keycloak:"):
+        return make_forbidden_response()
     assignment = store.assign_role_to_user(user.id, role_id)
     return jsonify({"assignment": assignment.to_json()})
 
@@ -6320,6 +6334,8 @@ def unassign_role():
     username = _get_request_param("username")
     role_id = _get_int_request_param("role_id")
     user = store.get_user(username)
+    if _keycloak_manages_user(username) and store.get_role(role_id).name.startswith("keycloak:"):
+        return make_forbidden_response()
     store.unassign_role_from_user(user.id, role_id)
     return make_response({})
 
@@ -7938,6 +7954,8 @@ def create_user_ui(csrf):
 
 @catch_mlflow_exception
 def create_user():
+    if auth_config.authorization_function == "mlflow.server.auth.keycloak:authenticate_request":
+        return make_forbidden_response()
     if not request.is_json:
         return make_response("Invalid content type. Must be application/json", 400)
 
@@ -7982,6 +8000,7 @@ def list_users():
         response_users.append({
             "id": u.id,
             "username": u.username,
+            "display_name": u.display_name,
             "is_admin": u.is_admin,
             "roles": [r.to_json() for r in visible_roles],
         })
@@ -8001,9 +8020,16 @@ def get_current_user():
     username = authenticate_request().username
     user = store.get_user(username)
     is_basic_auth = auth_config.authorization_function == DEFAULT_AUTHORIZATION_FUNCTION
+    is_keycloak_auth = auth_config.authorization_function == (
+        "mlflow.server.auth.keycloak:authenticate_request"
+    )
+    user_payload = {"id": user.id, "username": user.username, "is_admin": user.is_admin}
+    if is_keycloak_auth:
+        user_payload["display_name"] = user.display_name
     return jsonify({
-        "user": {"id": user.id, "username": user.username, "is_admin": user.is_admin},
+        "user": user_payload,
         "is_basic_auth": is_basic_auth,
+        "is_keycloak_auth": is_keycloak_auth,
     })
 
 
@@ -8082,6 +8108,8 @@ def list_user_permissions():
 @catch_mlflow_exception
 def update_user_password():
     username = _get_request_param("username")
+    if _keycloak_manages_user(username):
+        return make_forbidden_response()
     password = _get_request_param("password")
     # Self-service flows re-assert current_password so a hijacked browser
     # session can't silently rotate it. Admin paths skip this check.
@@ -8115,6 +8143,8 @@ def update_user_password():
 @catch_mlflow_exception
 def update_user_admin():
     username = _get_request_param("username")
+    if _keycloak_manages_user(username):
+        return make_forbidden_response()
     is_admin = _get_request_param("is_admin")
     store.update_user(username, is_admin=is_admin)
     _invalidate_user_auth_cache(username)
@@ -8124,6 +8154,8 @@ def update_user_admin():
 @catch_mlflow_exception
 def delete_user():
     username = _get_request_param("username")
+    if _keycloak_manages_user(username):
+        return make_forbidden_response()
     # Admins cannot delete their own account — like blocking ``root`` from
     # ``userdel root`` on Unix. Without this guard the request still succeeds
     # but leaves the caller in a broken state (browser still has Basic Auth
@@ -9878,6 +9910,23 @@ def create_app(app: Flask = app):
     # CSRF protection. it's important that this is a static key,
     # otherwise CSRF validation won't work across workers.
     app.secret_key = get_flask_server_secret_key()
+    if auth_config.authorization_function == "mlflow.server.auth.keycloak:authenticate_request":
+        from mlflow.server.auth.keycloak import (
+            CALLBACK_PATH,
+            LOGIN_PATH,
+            LOGOUT_PATH,
+            callback,
+            get_config,
+            login,
+            logout,
+        )
+
+        config = get_config()
+        app.config["SESSION_COOKIE_SECURE"] = config.public_url.startswith("https://")
+        app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+        app.add_url_rule(_add_static_prefix(LOGIN_PATH), view_func=login, methods=["GET"])
+        app.add_url_rule(_add_static_prefix(CALLBACK_PATH), view_func=callback, methods=["GET"])
+        app.add_url_rule(_add_static_prefix(LOGOUT_PATH), view_func=logout, methods=["GET"])
 
     # we only need to protect the CREATE_USER_UI route, since that's
     # the only browser-accessible route. the rest are client / REST
@@ -9890,16 +9939,17 @@ def create_app(app: Flask = app):
 
     _auth_initialized = True
 
-    app.add_url_rule(
-        rule=SIGNUP,
-        view_func=signup,
-        methods=["GET"],
-    )
-    app.add_url_rule(
-        rule=CREATE_USER_UI,
-        view_func=lambda: create_user_ui(csrf),
-        methods=["POST"],
-    )
+    if auth_config.authorization_function != "mlflow.server.auth.keycloak:authenticate_request":
+        app.add_url_rule(
+            rule=SIGNUP,
+            view_func=signup,
+            methods=["GET"],
+        )
+        app.add_url_rule(
+            rule=CREATE_USER_UI,
+            view_func=lambda: create_user_ui(csrf),
+            methods=["POST"],
+        )
     for rule in [CREATE_USER, AJAX_CREATE_USER]:
         app.add_url_rule(
             rule=rule,

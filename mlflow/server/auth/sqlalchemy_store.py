@@ -239,7 +239,11 @@ class SqlAlchemyStore:
             ]
 
     def update_user(
-        self, username: str, password: str | None = None, is_admin: bool | None = None
+        self,
+        username: str,
+        password: str | None = None,
+        is_admin: bool | None = None,
+        display_name: str | None = None,
     ) -> User:
         with self.ManagedSessionMaker(read_only=False) as session:
             user = self._get_user(session, username)
@@ -249,6 +253,9 @@ class SqlAlchemyStore:
                 user.password_hash = pwhash
             if is_admin is not None:
                 user.is_admin = is_admin
+            if display_name is not None:
+                _validate_text_field("Display name", display_name, MAX_USERNAME_LENGTH)
+                user.display_name = display_name
             return user.to_mlflow_entity()
 
     def delete_user(self, username: str):

@@ -392,7 +392,7 @@ def build(package_type: PackageType) -> None:
                 "jfrog": ["mlflow-jfrog-plugin"],
                 "kubernetes": ["kubernetes"],
                 "langchain": langchain_requirements,
-                "auth": ["Flask-WTF<2"],
+                "auth": ["Flask-WTF<2", "PyJWT[crypto]<3,>=2.8.0"],
             }
             # Tracing SDK does not support extras
             if package_type != PackageType.TRACING
@@ -487,6 +487,7 @@ def _get_package_data(package_type: PackageType) -> dict[str, list[str]] | None:
             "temporary_db_migrations_for_pre_1_users/alembic.ini",
             "pyspark/ml/log_model_allowlist.txt",
             "server/auth/basic_auth.ini",
+            "server/auth/keycloak_auth.ini",
             "server/auth/db/migrations/alembic.ini",
             "server/uvicorn_log_config.yaml",
             "models/notebook_resources/**/*",
