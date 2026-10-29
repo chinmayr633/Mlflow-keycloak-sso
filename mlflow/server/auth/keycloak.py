@@ -37,6 +37,7 @@ _TIMEOUT = 5
 @dataclass(frozen=True)
 class KeycloakConfig:
     issuer: str
+    backchannel_issuer: str | None
     client_id: str
     client_secret: str
     public_url: str
@@ -53,6 +54,15 @@ def get_config() -> KeycloakConfig:
         return value
 
     issuer = required("MLFLOW_KEYCLOAK_ISSUER").rstrip("/")
+    backchannel_issuer = os.environ.get("MLFLOW_KEYCLOAK_BACKCHANNEL_ISSUER", "").strip().rstrip("/")
+    if backchannel_issuer:
+        parsed = urlparse(backchannel_issuer)
+        if parsed.scheme != "https" and not (
+            parsed.scheme == "http" and parsed.hostname in {"localhost", "127.0.0.1", "host.docker.internal"}
+        ):
+            raise ValueError("Keycloak backchannel issuer must use HTTPS (HTTP is allowed locally)")
+        if not parsed.netloc or parsed.query or parsed.fragment or parsed.username:
+            raise ValueError("Invalid Keycloak backchannel issuer")
     public_url = required("MLFLOW_KEYCLOAK_PUBLIC_URL").rstrip("/")
     for name, value in (("issuer", issuer), ("public URL", public_url)):
         parsed = urlparse(value)
@@ -82,6 +92,7 @@ def get_config() -> KeycloakConfig:
         role_map[source] = (target["workspace"], target["role"])
     return KeycloakConfig(
         issuer=issuer,
+        backchannel_issuer=backchannel_issuer or None,
         client_id=required("MLFLOW_KEYCLOAK_CLIENT_ID"),
         client_secret=required("MLFLOW_KEYCLOAK_CLIENT_SECRET"),
         public_url=public_url,
@@ -93,7 +104,8 @@ def get_config() -> KeycloakConfig:
 @functools.lru_cache(maxsize=1)
 def _metadata() -> dict:
     config = get_config()
-    res = requests.get(f"{config.issuer}/.well-known/openid-configuration", timeout=_TIMEOUT)
+    discovery_issuer = config.backchannel_issuer or config.issuer
+    res = requests.get(f"{discovery_issuer}/.well-known/openid-configuration", timeout=_TIMEOUT)
     res.raise_for_status()
     metadata = res.json()
     if not isinstance(metadata, dict):
@@ -107,10 +119,20 @@ def _metadata() -> dict:
     return metadata
 
 
+def _server_endpoint(endpoint: str) -> str:
+    config = get_config()
+    if config.backchannel_issuer:
+        return config.backchannel_issuer + endpoint.removeprefix(config.issuer)
+    return endpoint
+
+
 @functools.lru_cache(maxsize=1)
 def _jwks_client() -> jwt.PyJWKClient:
     return jwt.PyJWKClient(
-        _metadata()["jwks_uri"], cache_jwk_set=True, lifespan=300, timeout=_TIMEOUT
+        _server_endpoint(_metadata()["jwks_uri"]),
+        cache_jwk_set=True,
+        lifespan=300,
+        timeout=_TIMEOUT,
     )
 
 
@@ -303,7 +325,7 @@ def callback():
     config = get_config()
     try:
         res = requests.post(
-            _metadata()["token_endpoint"],
+            _server_endpoint(_metadata()["token_endpoint"]),
             data={
                 "grant_type": "authorization_code",
                 "code": code,

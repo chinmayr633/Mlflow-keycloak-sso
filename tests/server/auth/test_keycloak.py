@@ -18,14 +18,51 @@ def keycloak_config(monkeypatch):
     monkeypatch.setenv("MLFLOW_KEYCLOAK_CLIENT_ID", "mlflow")
     monkeypatch.setenv("MLFLOW_KEYCLOAK_CLIENT_SECRET", "test-secret")
     monkeypatch.setenv("MLFLOW_KEYCLOAK_ADMIN_ROLE", "client:super-admin")
+    monkeypatch.delenv("MLFLOW_KEYCLOAK_BACKCHANNEL_ISSUER", raising=False)
     monkeypatch.setenv(
         "MLFLOW_KEYCLOAK_ROLE_MAP",
         '{"group:/science":"keycloak:reader",'
         '"realm:editor":{"workspace":"team","role":"keycloak:editor"}}',
     )
     keycloak.get_config.cache_clear()
+    keycloak._metadata.cache_clear()
     yield
     keycloak.get_config.cache_clear()
+    keycloak._metadata.cache_clear()
+
+
+def test_backchannel_uses_internal_urls_and_public_issuer(monkeypatch):
+    monkeypatch.setenv(
+        "MLFLOW_KEYCLOAK_BACKCHANNEL_ISSUER",
+        "http://host.docker.internal:8080/realms/mlflow",
+    )
+    keycloak.get_config.cache_clear()
+    discovery_url = []
+    issuer = "https://keycloak.example/realms/mlflow"
+    metadata = {
+        "issuer": issuer,
+        "authorization_endpoint": f"{issuer}/protocol/openid-connect/auth",
+        "token_endpoint": f"{issuer}/protocol/openid-connect/token",
+        "jwks_uri": f"{issuer}/protocol/openid-connect/certs",
+        "end_session_endpoint": f"{issuer}/protocol/openid-connect/logout",
+    }
+
+    def get(url, *, timeout):
+        discovery_url.append(url)
+        return SimpleNamespace(raise_for_status=lambda: None, json=lambda: metadata)
+
+    monkeypatch.setattr(keycloak.requests, "get", get)
+    assert keycloak._metadata() == metadata
+    assert discovery_url == [
+        "http://host.docker.internal:8080/realms/mlflow/.well-known/openid-configuration"
+    ]
+    assert keycloak._server_endpoint(metadata["token_endpoint"]) == (
+        "http://host.docker.internal:8080/realms/mlflow/protocol/openid-connect/token"
+    )
+    assert keycloak._server_endpoint(metadata["jwks_uri"]) == (
+        "http://host.docker.internal:8080/realms/mlflow/protocol/openid-connect/certs"
+    )
+    assert keycloak._metadata()["authorization_endpoint"].startswith(issuer)
 
 
 def test_config_rejects_insecure_public_url(monkeypatch):

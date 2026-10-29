@@ -1,0 +1,17 @@
+FROM python:3.12-slim-bookworm
+
+WORKDIR /app
+COPY . .
+
+# Build mlflow/server/js/build with Yarn on the host before building this image.
+RUN test -f /app/mlflow/server/js/build/index.html
+
+RUN python -m pip install --no-cache-dir -e ".[auth]" \
+    && sed -i 's|database_uri = sqlite:///keycloak_auth.db|database_uri = sqlite:////data/keycloak_auth.db|' \
+        /app/mlflow/server/auth/keycloak_auth.ini
+
+ENV MLFLOW_AUTH_CONFIG_PATH=/app/mlflow/server/auth/keycloak_auth.ini
+
+EXPOSE 5000
+
+CMD ["python", "-m", "mlflow", "server", "--app-name", "basic-auth", "--host", "0.0.0.0", "--port", "5000", "--backend-store-uri", "sqlite:////data/mlflow.db", "--artifacts-destination", "/data/artifacts"]
