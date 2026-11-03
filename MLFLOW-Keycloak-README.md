@@ -43,19 +43,7 @@ py -3.12 --version
 node --version
 ```
 
-### 2. Set up Keycloak
-
-Start your Keycloak container separately and verify `http://localhost:8080/realms/mlflow/.well-known/openid-configuration` opens. Create realm `mlflow` and a **confidential OpenID Connect client** with client ID `mlflow` and the authorization code flow enabled. Configure:
-
-- Valid redirect URI: `http://localhost:5000/oauth/keycloak/callback`
-- Valid post-logout redirect URI: `http://localhost:5000/`
-- Web origin: `http://localhost:5000`
-- Client role `mlflow-super-admin`, assigned only to platform admins.
-- Client roles mapper with **Add to ID token** enabled, so `resource_access.mlflow.roles` contains the client roles. Include the `email` scope or a `preferred_username` claim for readable names.
-
-Create at least one Keycloak user and assign `mlflow-super-admin` to that user. Use other client roles for regular MLflow role mappings. Do not assign the admin role to users testing resource restrictions.
-
-### 3. Install the Python backend
+### 2. Install the Python backend
 
 From the repository root:
 
@@ -65,7 +53,7 @@ py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e ".[auth]"
 ```
 
-### 4. Configure local secrets
+### 3. Configure local secrets
 
 Create `.env` in the repository root. It is ignored by Git. Generate two independent random values with `.\.venv\Scripts\python.exe -c "import secrets; print(secrets.token_urlsafe(48))"` and place them in the two secret fields below. Copy the client secret from Keycloak. Replace the example values as needed:
 
@@ -85,7 +73,7 @@ For a Keycloak client role named `deny_role`, create an MLflow RBAC role named `
 
 Because the auth database is local and ignored, a fresh clone has no custom MLflow RBAC roles or permission definitions. After the first admin login, recreate roles such as `keycloak:deny_role` and their resource permissions in **Manage** before assigning them through Keycloak.
 
-### 5. Install and build the frontend
+### 4. Install and build the frontend
 
 From the repository root:
 
@@ -99,7 +87,7 @@ cd ../../..
 
 If `node_modules` already exists, the install step can reuse it. The resulting `mlflow/server/js/build` directory is ignored by Git and served by the MLflow server.
 
-### 6. Start MLflow
+### 5. Start MLflow
 
 From the repository root, with Keycloak running:
 
