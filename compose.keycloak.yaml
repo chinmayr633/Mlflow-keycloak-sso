@@ -1,0 +1,29 @@
+services:
+  mlflow:
+    image: mlflow-keycloak-sso:local
+    build:
+      context: .
+      dockerfile: Dockerfile.keycloak
+    env_file:
+      - .env
+    environment:
+      MLFLOW_AUTH_CONFIG_PATH: /app/mlflow/server/auth/keycloak_auth.ini
+      MLFLOW_KEYCLOAK_BACKCHANNEL_ISSUER: ${MLFLOW_KEYCLOAK_BACKCHANNEL_ISSUER:-http://host.docker.internal:8080/realms/mlflow}
+    ports:
+      - "5000:5000"
+    volumes:
+      - mlflow-data:/data
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/health', timeout=3)"
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
+volumes:
+  mlflow-data:

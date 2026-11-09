@@ -1,0 +1,1063 @@
+import json
+import os
+import re
+import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor
+
+import pytest
+
+import mlflow
+from mlflow.entities import Assessment, Feedback, Trace
+from mlflow.exceptions import MlflowException
+from mlflow.genai.judges import make_judge
+from mlflow.genai.scorers import Guidelines, Scorer, get_scorer, make_scorer_ensemble, scorer
+from mlflow.genai.scorers.base import SCORER_BACKEND_TRACKING, ScorerSamplingConfig
+from mlflow.genai.scorers.scorer_utils import (
+    BUILTIN_SCORER_PYDANTIC_DATA,
+    INSTRUCTIONS_JUDGE_PYDANTIC_DATA,
+    build_gateway_model,
+    extract_endpoint_ref,
+    extract_model_from_serialized_scorer,
+    find_custom_scorer_without_source,
+    get_scorer_definition_digest,
+    get_tool_call_signature,
+    is_gateway_model,
+    normalize_tool_call_arguments,
+    params_contain_custom_scorer_code,
+    parse_tool_call_expectations,
+    recreate_function,
+    scorer_params_use_direct_provider_model,
+    update_model_in_serialized_scorer,
+)
+from mlflow.genai.utils.type import FunctionCall
+
+# ============================================================================
+# HAPPY PATH TESTS
+# ============================================================================
+
+
+def test_simple_function_recreation():
+    source = "return x + y"
+    signature = "(x, y)"
+    func_name = "add_func"
+
+    recreated = recreate_function(source, signature, func_name)
+
+    assert recreated is not None
+    assert recreated.__name__ == func_name
+    assert recreated(3, 4) == 7
+    assert recreated(10, -5) == 5
+
+
+def test_function_with_control_flow():
+    source = """if x > 0:
+    return "positive"
+else:
+    return "non-positive" """
+    signature = "(x)"
+    func_name = "classify_number"
+
+    recreated = recreate_function(source, signature, func_name)
+
+    assert recreated is not None
+    assert recreated(5) == "positive"
+    assert recreated(-3) == "non-positive"
+    assert recreated(0) == "non-positive"
+
+
+def test_function_with_loop():
+    source = """total = 0
+for i in range(n):
+    total += i
+return total"""
+    signature = "(n)"
+    func_name = "sum_range"
+
+    recreated = recreate_function(source, signature, func_name)
+
+    assert recreated is not None
+    assert recreated(5) == 10  # 0+1+2+3+4
+    assert recreated(3) == 3  # 0+1+2
+    assert recreated(0) == 0
+
+
+def test_function_with_multiple_parameters():
+    source = """if threshold is None:
+    threshold = 5
+return len(text) > threshold"""
+    signature = "(text, threshold=None)"
+    func_name = "length_check"
+
+    recreated = recreate_function(source, signature, func_name)
+
+    assert recreated is not None
+    assert recreated("hello") is False  # len=5, not > 5
+    assert recreated("hello world") is True  # len=11, > 5
+    assert recreated("hi", 1) is True  # len=2, > 1
+
+
+def test_function_creating_feedback_object():
+    source = """import re
+words = re.findall(r'\\b\\w+\\b', text)
+return Feedback(value=len(words), rationale=f"Found {len(words)} words")"""
+    signature = "(text)"
+    func_name = "word_counter"
+
+    recreated = recreate_function(source, signature, func_name)
+
+    assert recreated is not None
+    result = recreated("hello world test")
+    assert isinstance(result, Feedback)
+    assert result.value == 3
+    assert "Found 3 words" in result.rationale
+
+
+def test_function_creating_assessment_object():
+    # Note: Assessment constructor doesn't take 'value' directly - it's an abstract base
+    # Use Feedback instead, which is a concrete subclass of Assessment
+    source = """score = 1 if "good" in response else 0
+return Feedback(name=name, value=score, rationale="Assessment result")"""
+    signature = "(response, name='test_assessment')"
+    func_name = "assess_response"
+
+    recreated = recreate_function(source, signature, func_name)
+
+    assert recreated is not None
+    result = recreated("This is good")
+    assert isinstance(result, Feedback)
+    assert isinstance(result, Assessment)  # Feedback is a subclass of Assessment
+    assert result.value == 1
+    assert result.name == "test_assessment"
+
+
+def test_complex_logic_function():
+    source = """result = {}
+for item in items:
+    if isinstance(item, str):
+        result[item] = len(item)
+    elif isinstance(item, (int, float)):
+        result[str(item)] = item * 2
+return result"""
+    signature = "(items)"
+    func_name = "process_items"
+
+    recreated = recreate_function(source, signature, func_name)
+
+    assert recreated is not None
+    result = recreated(["hello", 5, "world", 3.5])
+    expected = {"hello": 5, "5": 10, "world": 5, "3.5": 7.0}
+    assert result == expected
+
+
+# ============================================================================
+# SIGNATURE PARSING TESTS
+# ============================================================================
+
+
+def test_empty_signature():
+    source = "return 42"
+    signature = "()"
+    func_name = "get_answer"
+
+    recreated = recreate_function(source, signature, func_name)
+
+    assert recreated is not None
+    assert recreated() == 42
+
+
+def test_single_parameter_signature():
+    source = "return x * 2"
+    signature = "(x)"
+    func_name = "double"
+
+    recreated = recreate_function(source, signature, func_name)
+
+    assert recreated is not None
+    assert recreated(5) == 10
+
+
+def test_signature_with_whitespace():
+    source = "return a + b"
+    signature = "( a , b )"
+    func_name = "add_with_spaces"
+
+    recreated = recreate_function(source, signature, func_name)
+
+    assert recreated is not None
+    assert recreated(3, 7) == 10
+
+
+def test_signature_with_defaults():
+    source = "return base ** exponent"
+    signature = "(base, exponent=2)"
+    func_name = "power"
+
+    recreated = recreate_function(source, signature, func_name)
+
+    assert recreated is not None
+    assert recreated(3) == 9  # 3^2
+    assert recreated(2, 3) == 8  # 2^3
+
+
+def test_signature_with_parentheses_in_defaults():
+    source = "return sep.join(parts) + suffix"
+    signature = "(parts=('a', 'b'), sep=str('-'), suffix=')') -> str"
+    func_name = "join_parts"
+
+    recreated = recreate_function(source, signature, func_name)
+
+    assert recreated() == "a-b)"
+    assert recreated(("x", "y"), "+", "") == "x+y"
+
+
+def test_complex_signature():
+    source = """if data is None:
+    data = []
+return f"{prefix}: {len(data)} items" + (suffix or "")"""
+    signature = "(data=None, prefix='Result', suffix=None)"
+    func_name = "format_result"
+
+    recreated = recreate_function(source, signature, func_name)
+
+    assert recreated is not None
+    assert recreated() == "Result: 0 items"
+    assert recreated([1, 2, 3]) == "Result: 3 items"
+    assert recreated([1, 2], "Count", "!") == "Count: 2 items!"
+
+
+def test_empty_signature_string():
+    from mlflow.exceptions import MlflowException
+
+    source = "return 1"
+    signature = ""
+    func_name = "empty_sig"
+
+    with pytest.raises(MlflowException, match="Invalid signature format"):
+        recreate_function(source, signature, func_name)
+
+
+# ============================================================================
+# IMPORT NAMESPACE TESTS
+# ============================================================================
+
+
+def test_function_with_unavailable_import():
+    # Import errors occur at execution time, not definition time
+    source = """from some_nonexistent_module import NonExistentClass
+return NonExistentClass()"""
+    signature = "()"
+    func_name = "use_bad_import"
+
+    recreated = recreate_function(source, signature, func_name)
+
+    # Function should be created successfully
+    assert recreated is not None
+
+    # But should fail when called due to import error
+    with pytest.raises(ModuleNotFoundError, match="some_nonexistent_module"):
+        recreated()
+
+
+def test_function_with_undefined_variable():
+    source = "return undefined_variable * 2"
+    signature = "()"
+    func_name = "use_undefined"
+
+    recreated = recreate_function(source, signature, func_name)
+
+    # Function is created but will fail when called
+    assert recreated is not None
+
+    # Should raise NameError when called
+    with pytest.raises(NameError, match="undefined_variable"):
+        recreated()
+
+
+def test_function_with_syntax_error():
+    source = "if x > 0\n    return True"  # Missing colon
+    signature = "(x)"
+    func_name = "syntax_error_func"
+
+    with pytest.raises(SyntaxError, match="expected ':'"):
+        recreate_function(source, signature, func_name)
+
+
+def test_function_using_builtin_modules():
+    source = """import json
+import re
+data = {"count": len(re.findall(r'\\w+', text))}
+return json.dumps(data)"""
+    signature = "(text)"
+    func_name = "json_word_count"
+
+    recreated = recreate_function(source, signature, func_name)
+
+    assert recreated is not None
+    result = recreated("hello world test")
+
+    parsed = json.loads(result)
+    assert parsed["count"] == 3
+
+
+def test_mlflow_imports_available():
+    source = """# Test all available MLflow imports
+feedback = Feedback(value=True, rationale="test")
+# AssessmentSource should be available too
+from mlflow.entities.assessment_source import AssessmentSourceType
+source_obj = AssessmentSourceType.CODE  # Use the default source type
+# Test that Trace is available
+from mlflow.entities import TraceInfo, TraceState, TraceData
+from mlflow.entities.trace_location import (
+    TraceLocation,
+    TraceLocationType,
+    MlflowExperimentLocation,
+)
+from mlflow.entities.trace import Trace
+mlflow_exp_location = MlflowExperimentLocation(experiment_id="0")
+trace_location = TraceLocation(
+    type=TraceLocationType.MLFLOW_EXPERIMENT,
+    mlflow_experiment=mlflow_exp_location
+)
+trace_info = TraceInfo(
+    trace_id="test_trace_id",
+    trace_location=trace_location,
+    request_time=1000,
+    state=TraceState.OK
+)
+trace = Trace(info=trace_info, data=TraceData())
+return {"feedback": feedback, "source": source_obj, "trace": trace}"""
+    signature = "()"
+    func_name = "test_mlflow_imports"
+
+    recreated = recreate_function(source, signature, func_name)
+
+    assert recreated is not None
+    result = recreated()
+
+    assert isinstance(result["feedback"], Feedback)
+    # AssessmentSourceType should be available (it's an enum/class)
+    assert result["source"] is not None
+    assert result["source"] == "CODE"
+    # Check that Trace is available and can be instantiated
+    assert isinstance(result["trace"], Trace)
+
+
+def test_function_name_in_namespace():
+    source = "return 'success'"
+    signature = "()"
+    func_name = "test_name_func"
+
+    recreated = recreate_function(source, signature, func_name)
+
+    assert recreated is not None
+    assert recreated.__name__ == func_name
+
+
+def test_indentation_handling():
+    # Source without indentation - should be indented by the function
+    source = """x = 1
+y = 2
+return x + y"""
+    signature = "()"
+    func_name = "indentation_test"
+
+    recreated = recreate_function(source, signature, func_name)
+
+    assert recreated is not None
+    assert recreated() == 3
+
+
+def test_empty_source_code():
+    source = ""
+    signature = "()"
+    func_name = "empty_func"
+
+    # Empty source code should cause syntax error during function definition
+    with pytest.raises(SyntaxError, match="expected an indented block"):
+        recreate_function(source, signature, func_name)
+
+
+def test_function_with_import_error_at_runtime():
+    # Import that doesn't exist is referenced but not imported in the function
+    source = """try:
+    return NonExistentClass()
+except NameError:
+    return "import_failed" """
+    signature = "()"
+    func_name = "runtime_import_error"
+
+    recreated = recreate_function(source, signature, func_name)
+
+    # Function should be created successfully
+    assert recreated is not None
+    # But calling it should handle the missing import gracefully
+    result = recreated()
+    assert result == "import_failed"
+
+
+def test_function_with_mlflow_trace_type_hint():
+    """
+    Test that a function with mlflow.entities.Trace type hints can be recreated.
+
+    This reproduces the issue where scorers with type hints like mlflow.entities.Trace
+    would fail to register because the mlflow module wasn't available in the namespace
+    during function recreation.
+    """
+    source = """return Feedback(
+    value=trace.info.trace_id is not None,
+    rationale=f"Trace ID: {trace.info.trace_id}"
+)"""
+    signature = "(trace: mlflow.entities.Trace) -> mlflow.entities.Feedback"
+    func_name = "scorer_with_trace_type_hint"
+
+    recreated = recreate_function(source, signature, func_name)
+
+    assert recreated is not None
+    assert recreated.__name__ == func_name
+
+    # Test that it can be called with a Trace object
+    from mlflow.entities import TraceData, TraceInfo, TraceState
+    from mlflow.entities.trace_location import (
+        MlflowExperimentLocation,
+        TraceLocation,
+        TraceLocationType,
+    )
+
+    mlflow_exp_location = MlflowExperimentLocation(experiment_id="0")
+    trace_location = TraceLocation(
+        type=TraceLocationType.MLFLOW_EXPERIMENT, mlflow_experiment=mlflow_exp_location
+    )
+    trace_info = TraceInfo(
+        trace_id="test_trace_id",
+        trace_location=trace_location,
+        request_time=1000,
+        state=TraceState.OK,
+    )
+    trace = Trace(info=trace_info, data=TraceData())
+
+    result = recreated(trace)
+    assert isinstance(result, Feedback)
+    assert result.value is True
+    assert "test_trace_id" in result.rationale
+
+
+# ============================================================================
+# GATEWAY MODEL UTILITY TESTS
+# ============================================================================
+
+
+def test_is_gateway_model():
+    assert is_gateway_model("gateway:/my-endpoint") is True
+    assert is_gateway_model("openai:/gpt-4") is False
+    assert is_gateway_model(None) is False
+
+
+def test_extract_and_build_gateway_model():
+    assert extract_endpoint_ref("gateway:/my-endpoint") == "my-endpoint"
+    assert build_gateway_model("my-endpoint") == "gateway:/my-endpoint"
+    assert extract_endpoint_ref(build_gateway_model("test")) == "test"
+
+
+def test_extract_model_from_serialized_scorer():
+    instructions_judge_scorer = {
+        "mlflow_version": "3.3.2",
+        "serialization_version": 1,
+        "name": "quality_scorer",
+        "description": "Evaluates response quality",
+        "aggregations": [],
+        "is_session_level_scorer": False,
+        "builtin_scorer_class": None,
+        "builtin_scorer_pydantic_data": None,
+        "call_source": None,
+        "call_signature": None,
+        "original_func_name": None,
+        INSTRUCTIONS_JUDGE_PYDANTIC_DATA: {
+            "instructions": "Evaluate the response quality",
+            "model": "gateway:/my-endpoint",
+        },
+    }
+    assert extract_model_from_serialized_scorer(instructions_judge_scorer) == "gateway:/my-endpoint"
+
+    builtin_scorer = {
+        "mlflow_version": "3.3.2",
+        "serialization_version": 1,
+        "name": "guidelines_scorer",
+        "description": None,
+        "aggregations": [],
+        "is_session_level_scorer": False,
+        "builtin_scorer_class": "Guidelines",
+        BUILTIN_SCORER_PYDANTIC_DATA: {
+            "name": "guidelines_scorer",
+            "required_columns": ["outputs", "inputs"],
+            "guidelines": ["Be helpful", "Be accurate"],
+            "model": "openai:/gpt-4",
+        },
+        "call_source": None,
+        "call_signature": None,
+        "original_func_name": None,
+        "instructions_judge_pydantic_data": None,
+    }
+    assert extract_model_from_serialized_scorer(builtin_scorer) == "openai:/gpt-4"
+    assert extract_model_from_serialized_scorer({}) is None
+
+
+def test_update_model_in_serialized_scorer():
+    data = {
+        "mlflow_version": "3.3.2",
+        "serialization_version": 1,
+        "name": "quality_scorer",
+        INSTRUCTIONS_JUDGE_PYDANTIC_DATA: {
+            "instructions": "Evaluate quality",
+            "model": "gateway:/old-endpoint",
+        },
+    }
+    result = update_model_in_serialized_scorer(data, "gateway:/new-endpoint")
+    assert result[INSTRUCTIONS_JUDGE_PYDANTIC_DATA]["model"] == "gateway:/new-endpoint"
+    assert result[INSTRUCTIONS_JUDGE_PYDANTIC_DATA]["instructions"] == "Evaluate quality"
+    assert data[INSTRUCTIONS_JUDGE_PYDANTIC_DATA]["model"] == "gateway:/old-endpoint"
+
+
+def test_extract_model_from_third_party_scorer():
+    llm_scorer = {
+        "name": "faithfulness",
+        "third_party_scorer_data": {
+            "module": "mlflow.genai.scorers.ragas.scorers.rag_metrics",
+            "class": "Faithfulness",
+            "metric_name": "Faithfulness",
+            "model": "openai:/gpt-4o",
+            "kwargs": {},
+        },
+    }
+    assert extract_model_from_serialized_scorer(llm_scorer) == "openai:/gpt-4o"
+
+    deterministic_scorer = {
+        "name": "exact_match",
+        "third_party_scorer_data": {
+            "module": "mlflow.genai.scorers.ragas.scorers.comparison_metrics",
+            "class": "ExactMatch",
+            "metric_name": "ExactMatch",
+            "model": None,
+            "kwargs": {},
+        },
+    }
+    assert extract_model_from_serialized_scorer(deterministic_scorer) is None
+
+
+def test_update_model_in_third_party_scorer():
+    llm_scorer = {
+        "name": "faithfulness",
+        "third_party_scorer_data": {
+            "module": "mlflow.genai.scorers.ragas.scorers.rag_metrics",
+            "class": "Faithfulness",
+            "metric_name": "Faithfulness",
+            "model": "openai:/old",
+            "kwargs": {},
+        },
+    }
+    result = update_model_in_serialized_scorer(llm_scorer, "openai:/new")
+    assert result["third_party_scorer_data"]["model"] == "openai:/new"
+    assert llm_scorer["third_party_scorer_data"]["model"] == "openai:/old"
+
+    # Deterministic scorer (model=None) must not gain a model — the wrapper
+    # constructor rejects `model=` and the round-trip would break.
+    deterministic_scorer = {
+        "name": "exact_match",
+        "third_party_scorer_data": {
+            "module": "mlflow.genai.scorers.ragas.scorers.comparison_metrics",
+            "class": "ExactMatch",
+            "metric_name": "ExactMatch",
+            "model": None,
+            "kwargs": {},
+        },
+    }
+    result = update_model_in_serialized_scorer(deterministic_scorer, "openai:/new")
+    assert result["third_party_scorer_data"]["model"] is None
+
+
+# ============================================================================
+# TOOL CALL HELPER FUNCTION TESTS
+# ============================================================================
+
+
+@pytest.mark.parametrize(
+    "expectations",
+    [None, {}, {"expected_tool_calls": []}],
+)
+def test_parse_tool_call_expectations_returns_none_for_empty(expectations):
+    assert parse_tool_call_expectations(expectations) is None
+
+
+def test_parse_tool_call_expectations_parses_dict():
+    expectations = {
+        "expected_tool_calls": [
+            {"name": "search", "arguments": {"query": "test"}},
+            {"name": "summarize"},
+        ]
+    }
+    result = parse_tool_call_expectations(expectations)
+
+    assert len(result) == 2
+    assert result[0].name == "search"
+    assert result[0].arguments == {"query": "test"}
+    assert result[1].name == "summarize"
+    assert result[1].arguments is None
+
+
+def test_parse_tool_call_expectations_parses_function_call_objects():
+    expectations = {
+        "expected_tool_calls": [
+            FunctionCall(name="search", arguments={"query": "test"}),
+            FunctionCall(name="summarize"),
+        ]
+    }
+    result = parse_tool_call_expectations(expectations)
+
+    assert len(result) == 2
+    assert result[0].name == "search"
+    assert result[1].name == "summarize"
+
+
+@pytest.mark.parametrize(
+    ("expectations", "expected_error"),
+    [
+        (
+            {"expected_tool_calls": [{"name": "search", "arguments": "invalid"}]},
+            "Arguments must be a dict",
+        ),
+        ({"expected_tool_calls": ["invalid_string"]}, "Invalid expected tool call format"),
+    ],
+)
+def test_parse_tool_call_expectations_raises_for_invalid_input(expectations, expected_error):
+    with pytest.raises(MlflowException, match=expected_error):
+        parse_tool_call_expectations(expectations)
+
+
+@pytest.mark.parametrize(
+    ("args", "expected"),
+    [
+        (None, {}),
+        ({"query": "test", "limit": 10}, {"query": "test", "limit": 10}),
+    ],
+)
+def test_normalize_tool_call_arguments(args, expected):
+    assert normalize_tool_call_arguments(args) == expected
+
+
+def test_normalize_tool_call_arguments_raises_for_invalid_type():
+    with pytest.raises(MlflowException, match="Arguments must be a dict"):
+        normalize_tool_call_arguments("invalid")
+
+
+@pytest.mark.parametrize(
+    ("call", "include_arguments", "expected"),
+    [
+        (FunctionCall(name="search", arguments={"query": "test"}), False, "search"),
+        (
+            FunctionCall(name="search", arguments={"query": "test"}),
+            True,
+            'search({"query": "test"})',
+        ),
+        (FunctionCall(name="search"), True, "search({})"),
+        (FunctionCall(name=None), False, None),
+    ],
+)
+def test_get_tool_call_signature(call, include_arguments, expected):
+    assert get_tool_call_signature(call, include_arguments) == expected
+
+
+def test_get_tool_call_signature_sorts_arguments():
+    call1 = FunctionCall(name="search", arguments={"b": 2, "a": 1})
+    call2 = FunctionCall(name="search", arguments={"a": 1, "b": 2})
+
+    sig1 = get_tool_call_signature(call1, include_arguments=True)
+    sig2 = get_tool_call_signature(call2, include_arguments=True)
+    assert sig1 == sig2
+
+
+# ============================================================================
+# CUSTOM-SCORER DETECTION AND REMOTE-COMPATIBILITY TESTS
+# ============================================================================
+
+
+def _custom_scorer_json():
+    return json.dumps({
+        "name": "c",
+        "call_source": "    return 1\n",
+        "call_signature": "(inputs, outputs)",
+        "original_func_name": "c",
+    })
+
+
+def _builtin_scorer_json():
+    return json.dumps({"name": "b", "builtin_scorer_class": "Safety"})
+
+
+def _judge_scorer_json(model_uri):
+    return json.dumps({"name": "j", "instructions_judge_pydantic_data": {"model": model_uri}})
+
+
+def test_invoke_scorer_custom_detected():
+    params = {"serialized_scorer": _custom_scorer_json(), "trace_ids": ["t1"]}
+    assert params_contain_custom_scorer_code("invoke_scorer", params) is True
+
+
+def test_invoke_scorer_builtin_not_custom():
+    params = {"serialized_scorer": _builtin_scorer_json(), "trace_ids": ["t1"]}
+    assert params_contain_custom_scorer_code("invoke_scorer", params) is False
+
+
+def test_online_scorers_custom_detected():
+    params = {
+        "experiment_id": "e",
+        "online_scorers": [
+            {"serialized_scorer": _builtin_scorer_json()},
+            {"serialized_scorer": _custom_scorer_json()},
+        ],
+    }
+    assert params_contain_custom_scorer_code("run_online_trace_scorer", params) is True
+
+
+def test_non_scorer_job_not_custom():
+    assert params_contain_custom_scorer_code("optimize_prompts", {"anything": 1}) is False
+
+
+def test_malformed_serialized_scorer_raises():
+    params = {"serialized_scorer": "not json"}
+    with pytest.raises(MlflowException, match="Malformed serialized scorer"):
+        params_contain_custom_scorer_code("invoke_scorer", params)
+
+
+def test_custom_scorer_execution_blocked(monkeypatch):
+    from mlflow.genai.scorers.scorer_utils import custom_scorer_execution_blocked
+
+    custom = json.loads(_custom_scorer_json())
+    builtin = json.loads(_builtin_scorer_json())
+
+    monkeypatch.delenv("MLFLOW_SERVER_ENABLE_CUSTOM_SCORERS", raising=False)
+    assert custom_scorer_execution_blocked(custom) is True
+    assert custom_scorer_execution_blocked(builtin) is False
+
+    monkeypatch.setenv("MLFLOW_SERVER_ENABLE_CUSTOM_SCORERS", "true")
+    assert custom_scorer_execution_blocked(custom) is False
+
+
+def test_direct_provider_model_flagged():
+    params = {"serialized_scorer": _judge_scorer_json("openai:/gpt-4")}
+    assert scorer_params_use_direct_provider_model("invoke_scorer", params) is True
+
+
+def test_gateway_endpoint_model_ok():
+    params = {"serialized_scorer": _judge_scorer_json("endpoints:/my-endpoint")}
+    assert scorer_params_use_direct_provider_model("invoke_scorer", params) is False
+
+
+def test_no_model_is_compatible():
+    params = {"serialized_scorer": _builtin_scorer_json()}
+    assert scorer_params_use_direct_provider_model("invoke_scorer", params) is False
+
+
+def test_online_scorers_direct_provider_flagged():
+    params = {"online_scorers": [{"serialized_scorer": _judge_scorer_json("anthropic:/claude")}]}
+    assert scorer_params_use_direct_provider_model("run_online_trace_scorer", params) is True
+
+
+def test_invoke_genai_evaluate_custom_detected():
+    # This job carries a plural `serialized_scorers` list, not a single `serialized_scorer`.
+    params = {
+        "serialized_scorers": [_builtin_scorer_json(), _custom_scorer_json()],
+        "trace_ids": ["t1"],
+    }
+    assert params_contain_custom_scorer_code("invoke_genai_evaluate", params) is True
+
+
+def test_invoke_genai_evaluate_builtin_not_custom():
+    params = {"serialized_scorers": [_builtin_scorer_json()], "trace_ids": ["t1"]}
+    assert params_contain_custom_scorer_code("invoke_genai_evaluate", params) is False
+
+
+def test_ensemble_nested_custom_detected():
+    # A decorator sub-scorer nested inside an ensemble must be detected even though the
+    # top-level scorer has no `call_source`.
+    ensemble = json.dumps({
+        "name": "e",
+        "ensemble_scorer_data": {
+            "scorers": [
+                {"name": "b", "builtin_scorer_class": "Safety"},
+                {
+                    "name": "c",
+                    "call_source": "    return 1\n",
+                    "call_signature": "(inputs, outputs)",
+                    "original_func_name": "c",
+                },
+            ]
+        },
+    })
+    assert (
+        params_contain_custom_scorer_code("invoke_scorer", {"serialized_scorer": ensemble}) is True
+    )
+
+
+def test_gateway_scheme_model_ok():
+    params = {"serialized_scorer": _judge_scorer_json("gateway:/my-endpoint")}
+    assert scorer_params_use_direct_provider_model("invoke_scorer", params) is False
+
+
+def test_databricks_scheme_model_ok():
+    params = {"serialized_scorer": _judge_scorer_json("databricks:/my-endpoint")}
+    assert scorer_params_use_direct_provider_model("invoke_scorer", params) is False
+
+
+@pytest.mark.parametrize("model", ["databricks", "gpt-oss-120b"])
+def test_bare_model_name_flagged(model):
+    # A model value with no "scheme:/" is a direct-provider model (not gateway-backed), so the
+    # check must fail closed and flag it rather than let it pass to a remote executor.
+    params = {"serialized_scorer": _judge_scorer_json(model)}
+    assert scorer_params_use_direct_provider_model("invoke_scorer", params) is True
+
+
+def test_empty_model_is_compatible():
+    # An empty model string means no model was specified (not a direct-provider URI), so it is
+    # treated as compatible rather than flagged.
+    params = {"serialized_scorer": _judge_scorer_json("")}
+    assert scorer_params_use_direct_provider_model("invoke_scorer", params) is False
+
+
+def test_scorer_detection_job_names_match_registered_jobs():
+    # The detection job-name sets must stay in sync with the actual registered scorer job
+    # names; a rename that touches only one side would silently fail the gate open.
+    from mlflow.genai.evaluation.job import invoke_genai_evaluate_job
+    from mlflow.genai.scorers.job import (
+        invoke_scorer_job,
+        run_online_session_scorer_job,
+        run_online_trace_scorer_job,
+    )
+    from mlflow.genai.scorers.scorer_utils import _scorer_job_param_names
+
+    inline, inline_list, online = _scorer_job_param_names()
+    detected = inline | inline_list | online
+    registered = {
+        invoke_scorer_job._job_fn_metadata.name,
+        invoke_genai_evaluate_job._job_fn_metadata.name,
+        run_online_trace_scorer_job._job_fn_metadata.name,
+        run_online_session_scorer_job._job_fn_metadata.name,
+    }
+    assert detected == registered
+
+
+# ============================================================================
+# SCORER DEFINITION DIGEST TESTS
+# ============================================================================
+
+
+def _check_scorer():
+    @scorer
+    def check(outputs) -> bool:
+        return bool(outputs)
+
+    return check
+
+
+def _check_scorer_with_docstring():
+    @scorer
+    def check(outputs) -> bool:
+        """Check that there is an output."""
+        return bool(outputs)
+
+    return check
+
+
+def _check_scorer_with_new_body():
+    @scorer
+    def check(outputs) -> bool:
+        return len(outputs) > 1
+
+    return check
+
+
+def _guidelines(guidelines=("Be concise",)):
+    return Guidelines(name="concise", guidelines=list(guidelines))
+
+
+def _judge(instructions="Is {{ outputs }} concise?"):
+    return make_judge(name="judge", instructions=instructions, feedback_value_type=bool)
+
+
+@pytest.mark.parametrize("make_scorer", [_check_scorer, _guidelines, _judge])
+def test_definition_digest_is_stable_for_the_same_definition(make_scorer):
+    digest = get_scorer_definition_digest(make_scorer())
+
+    assert re.fullmatch(r"sha256:[0-9a-f]{64}", digest)
+    assert get_scorer_definition_digest(make_scorer()) == digest
+
+
+def test_definition_digest_ignores_the_docstring():
+    assert get_scorer_definition_digest(_check_scorer()) == get_scorer_definition_digest(
+        _check_scorer_with_docstring()
+    )
+
+
+@pytest.mark.parametrize(
+    ("original", "changed"),
+    [
+        (_check_scorer, _check_scorer_with_new_body),
+        (_guidelines, lambda: _guidelines(["Be polite"])),
+        (_judge, lambda: _judge("Is {{ outputs }} polite?")),
+    ],
+)
+def test_definition_digest_changes_with_the_definition(original, changed):
+    assert get_scorer_definition_digest(original()) != get_scorer_definition_digest(changed())
+
+
+def test_definition_digest_ignores_the_mlflow_version(monkeypatch):
+    digest = get_scorer_definition_digest(_guidelines())
+
+    monkeypatch.setattr(mlflow, "__version__", "0.0.1")
+
+    assert _guidelines().model_dump()["mlflow_version"] == "0.0.1"
+    assert get_scorer_definition_digest(_guidelines()) == digest
+
+
+def test_definition_digest_ignores_the_sampling_config():
+    sampled = _guidelines()._set_registration_metadata(
+        backend=SCORER_BACKEND_TRACKING,
+        experiment_id="1",
+        sampling_config=ScorerSamplingConfig(sample_rate=0.5, filter_string="tags.env = 'prod'"),
+    )
+
+    assert get_scorer_definition_digest(sampled) == get_scorer_definition_digest(_guidelines())
+
+
+@pytest.mark.parametrize("make_scorer", [_check_scorer, _guidelines, _judge])
+def test_definition_digest_matches_after_a_registry_round_trip(make_scorer, monkeypatch):
+    monkeypatch.setenv("MLFLOW_SERVER_ENABLE_CUSTOM_SCORERS", "true")
+    experiment_id = mlflow.create_experiment("definition-digest-round-trip")
+    local = make_scorer()
+    local.register(experiment_id=experiment_id)
+
+    loaded = get_scorer(name=local.name, experiment_id=experiment_id)
+
+    assert loaded.scorer_version == 1
+    assert get_scorer_definition_digest(loaded) == get_scorer_definition_digest(make_scorer())
+
+
+def test_definition_digest_of_a_builtin_scorer_does_not_depend_on_the_hash_seed():
+    code = (
+        "from mlflow.genai.scorers import Guidelines\n"
+        "from mlflow.genai.scorers.scorer_utils import get_scorer_definition_digest\n"
+        "print(get_scorer_definition_digest(Guidelines(name='concise', guidelines=['Be concise'])))"
+    )
+    digests = {
+        subprocess.check_output(
+            [sys.executable, "-c", code], env={**os.environ, "PYTHONHASHSEED": seed}, text=True
+        ).strip()
+        for seed in ["1", "2"]
+    }
+
+    assert digests == {get_scorer_definition_digest(_guidelines(["Be concise"]))}
+
+
+def test_definition_digest_changes_after_the_scorer_is_edited():
+    check = _check_scorer()
+    digest = get_scorer_definition_digest(check)
+
+    check.description = "Checks that there is an output."
+
+    assert get_scorer_definition_digest(check) != digest
+
+
+def test_definition_digest_leaves_scorer_caches_unchanged():
+    check = _check_scorer()
+    inner = make_scorer_ensemble(name="inner", scorers=[check], ensemble_fn="maximum")
+    outer = make_scorer_ensemble(name="outer", scorers=[inner], ensemble_fn="maximum")
+
+    get_scorer_definition_digest(check)
+    get_scorer_definition_digest(inner)
+    get_scorer_definition_digest(outer)
+
+    assert check._cached_dump is None
+
+
+def test_definition_digest_leaves_scorer_cache_unchanged_across_threads():
+    switch_interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    try:
+        checks = [_check_scorer() for _ in range(50)]
+        for check in checks:
+            with ThreadPoolExecutor(max_workers=16, thread_name_prefix="digest-test") as pool:
+                list(pool.map(lambda _: get_scorer_definition_digest(check), range(32)))
+    finally:
+        sys.setswitchinterval(switch_interval)
+
+    assert all(check._cached_dump is None for check in checks)
+
+
+def test_definition_digest_matches_a_legacy_dump_without_timeout():
+    dump = _judge().model_dump()
+    dump.pop("timeout")
+
+    legacy = Scorer.model_validate(dump)
+
+    assert get_scorer_definition_digest(legacy) == get_scorer_definition_digest(_judge())
+
+
+class _UserScorer(Scorer):
+    name: str = "user_scorer"
+
+    def __call__(self, *, outputs=None, **kwargs):
+        return True
+
+
+class _NonJsonScorer(Scorer):
+    name: str = "non_json"
+
+    def model_dump(self, **kwargs):
+        return {"third_party_scorer_data": {"kwargs": {"client": object()}}}
+
+    def __call__(self, *, outputs=None, **kwargs):
+        return True
+
+
+def test_definition_digest_of_a_user_scorer_subclass_uses_its_class_source():
+    assert get_scorer_definition_digest(_UserScorer()).startswith("sha256:")
+    assert get_scorer_definition_digest(_UserScorer()) == get_scorer_definition_digest(
+        _UserScorer()
+    )
+
+
+@pytest.mark.parametrize(
+    "unhashable",
+    [
+        make_scorer_ensemble(name="ensemble", scorers=[_check_scorer()], ensemble_fn=max),
+        _NonJsonScorer(),
+        object(),
+    ],
+    ids=["custom_function_ensemble", "non_json_kwargs", "not_a_scorer"],
+)
+def test_definition_digest_is_none_when_the_definition_cannot_be_hashed(unhashable):
+    assert get_scorer_definition_digest(unhashable) is None
+
+
+@pytest.mark.parametrize(
+    ("serialized", "expected"),
+    [
+        ({"name": "ok", "call_source": "return 1", "call_signature": "()"}, None),
+        ({"name": "builtin", "builtin_scorer_class": "Safety"}, None),
+        ({"name": "no_source", "call_source": "", "call_signature": "()"}, "no_source"),
+        ({"name": "blank", "call_source": "  \n ", "call_signature": "()"}, "blank"),
+        (
+            {
+                "name": "ensemble",
+                "ensemble_scorer_data": {
+                    "scorers": [
+                        {"name": "ok", "call_source": "return 1"},
+                        {"name": "inner", "call_source": ""},
+                    ]
+                },
+            },
+            "inner",
+        ),
+    ],
+)
+def test_find_custom_scorer_without_source(serialized, expected):
+    assert find_custom_scorer_without_source(serialized) == expected

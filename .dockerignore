@@ -1,0 +1,46 @@
+# This file is used by tests (e.g., tests/projects/utils.py:docker_example_base_image)
+# to exclude unnecessary files when copying the MLflow source tree for Docker builds.
+# Without this file, Docker images built during testing would be extremely large and
+# could cause disk space issues.
+
+.git
+.env
+.venv
+mlflow/server/js/node_modules
+**/node_modules
+**/__pycache__
+**/*.db
+mlruns
+docs
+apidocs
+mlflow.Rcheck
+outputs
+examples
+
+dev
+# required for Docker build
+!requirements/test-requirements.txt
+!requirements/lint-requirements.txt
+!requirements/extra-ml-requirements.txt
+
+tests
+# required for Docker build
+!tests/resources/mlflow-test-plugin/
+
+node_modules
+coverage
+build
+!mlflow/server/js/build
+!mlflow/server/js/build/**
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+__pycache__
+*.db
+*.db-*
+.*
+!mlflow/server/js/.yarnrc.yml
+!mlflow/server/js/.npmrc
+~*
+*.swp
+*.pyc

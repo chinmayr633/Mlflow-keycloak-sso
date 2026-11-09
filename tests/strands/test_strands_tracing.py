@@ -1,0 +1,384 @@
+import json
+from collections.abc import AsyncIterator, Sequence
+from typing import Any
+
+import pytest
+from opentelemetry import trace as otel_trace
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from strands import Agent
+from strands.models.model import Model
+from strands.tools.tools import PythonAgentTool
+
+import mlflow
+from mlflow.entities import SpanType
+from mlflow.environment_variables import MLFLOW_USE_DEFAULT_TRACER_PROVIDER
+from mlflow.tracing.constant import SpanAttributeKey
+from mlflow.tracing.provider import trace_disabled
+
+from tests.tracing.helper import get_traces
+
+
+def _core_token_usage(usage: dict[str, int]) -> dict[str, int]:
+    # strands >= 1.54 also reports (often zero) cache-token counts in the usage metadata.
+    # Restrict to the core keys so these assertions stay robust across strands versions.
+    return {k: usage[k] for k in ("input_tokens", "output_tokens", "total_tokens")}
+
+
+async def sum_tool(tool_use, **_):
+    a = tool_use["input"]["a"]
+    b = tool_use["input"]["b"]
+    return {
+        "toolUseId": tool_use["toolUseId"],
+        "status": "success",
+        "content": [{"json": a + b}],
+    }
+
+
+tool = PythonAgentTool(
+    "sum",
+    {
+        "name": "sum",
+        "description": "add numbers 1 2",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"a": {"type": "number"}, "b": {"type": "number"}},
+            "required": ["a", "b"],
+        },
+    },
+    sum_tool,
+)
+
+
+class DummyModel(Model):
+    def __init__(self, response_text: str, in_tokens: int = 1, out_tokens: int = 1):
+        self.response_text = response_text
+        self.in_tokens = in_tokens
+        self.out_tokens = out_tokens
+        self.config = {}
+
+    def update_config(self, **model_config):
+        self.config.update(model_config)
+
+    def get_config(self):
+        return self.config
+
+    async def structured_output(self, output_model, prompt, system_prompt=None, **kwargs):
+        if False:
+            yield {}
+
+    async def stream(
+        self,
+        messages: Sequence[dict[str, Any]],
+        tool_specs: Any | None = None,
+        system_prompt: str | None = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[dict[str, Any]]:
+        yield {"messageStart": {"role": "assistant"}}
+        yield {"contentBlockStart": {"start": {}}}
+        yield {"contentBlockDelta": {"delta": {"text": self.response_text}}}
+        yield {"contentBlockStop": {}}
+        yield {"messageStop": {"stopReason": "end_turn"}}
+        yield {
+            "metadata": {
+                "usage": {
+                    "inputTokens": self.in_tokens,
+                    "outputTokens": self.out_tokens,
+                    "totalTokens": self.in_tokens + self.out_tokens,
+                },
+                "metrics": {"latencyMs": 0},
+            }
+        }
+
+
+class ToolCallingModel(Model):
+    def __init__(
+        self,
+        response_text: str,
+        tool_input: dict[str, Any] | None = None,
+        tool_name: str = "sum",
+    ):
+        self.response_text = response_text
+        self.tool_input = tool_input or {"a": 1, "b": 2}
+        self.tool_name = tool_name
+        self.config = {}
+        self._call_count = 0
+
+    def update_config(self, **model_config: Any) -> None:
+        self.config.update(model_config)
+
+    def get_config(self) -> dict[str, object]:
+        return self.config
+
+    async def structured_output(
+        self,
+        output_model: Any,
+        prompt: Any,
+        system_prompt: str | None = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[dict[str, Any]]:
+        if False:
+            yield {}
+
+    async def stream(
+        self,
+        messages: Sequence[dict[str, Any]],
+        tool_specs: Any | None = None,
+        system_prompt: str | None = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[dict[str, Any]]:
+        if self._call_count == 0:
+            self._call_count += 1
+            yield {"messageStart": {"role": "assistant"}}
+            yield {
+                "contentBlockStart": {
+                    "start": {
+                        "toolUse": {
+                            "toolUseId": "tool-1",
+                            "name": self.tool_name,
+                        }
+                    }
+                }
+            }
+            yield {
+                "contentBlockDelta": {"delta": {"toolUse": {"input": json.dumps(self.tool_input)}}}
+            }
+            yield {"contentBlockStop": {}}
+            yield {"messageStop": {"stopReason": "tool_use"}}
+            yield {
+                "metadata": {
+                    "usage": {
+                        "inputTokens": 1,
+                        "outputTokens": 1,
+                        "totalTokens": 2,
+                    },
+                    "metrics": {"latencyMs": 0},
+                }
+            }
+        else:
+            yield {"messageStart": {"role": "assistant"}}
+            yield {"contentBlockStart": {"start": {}}}
+            yield {"contentBlockDelta": {"delta": {"text": self.response_text}}}
+            yield {"contentBlockStop": {}}
+            yield {"messageStop": {"stopReason": "end_turn"}}
+            yield {
+                "metadata": {
+                    "usage": {
+                        "inputTokens": 1,
+                        "outputTokens": 1,
+                        "totalTokens": 2,
+                    },
+                    "metrics": {"latencyMs": 0},
+                }
+            }
+
+
+def test_strands_autolog_single_trace():
+    mlflow.strands.autolog()
+
+    agent = Agent(model=DummyModel("hi", 1, 2), name="agent")
+    agent("hello")
+
+    traces = get_traces()
+    assert len(traces) == 1
+    spans = traces[0].data.spans
+    agent_span = next(span for span in spans if span.span_type == SpanType.AGENT)
+    assert agent_span.inputs == [{"role": "user", "content": [{"text": "hello"}]}]
+    assert agent_span.outputs.strip() == "hi"
+
+    usage_spans = [span for span in spans if span.attributes.get(SpanAttributeKey.CHAT_USAGE)]
+    assert usage_spans, "expected at least one child span recording token usage"
+    assert _core_token_usage(usage_spans[0].attributes[SpanAttributeKey.CHAT_USAGE]) == {
+        "input_tokens": 1,
+        "output_tokens": 2,
+        "total_tokens": 3,
+    }
+    assert _core_token_usage(traces[0].info.token_usage) == {
+        "input_tokens": 1,
+        "output_tokens": 2,
+        "total_tokens": 3,
+    }
+
+    mlflow.strands.autolog(disable=True)
+    agent("bye")
+    assert len(get_traces()) == 1
+
+
+def test_function_calling_creates_single_trace():
+    mlflow.strands.autolog()
+
+    agent = Agent(model=ToolCallingModel("3"), tools=[tool], name="agent")
+    agent("add numbers 1 2 1 2")
+
+    traces = get_traces()
+    assert len(traces) == 1
+    spans = traces[0].data.spans
+    agent_span = spans[0]
+    assert agent_span.span_type == SpanType.AGENT
+    tool_span = spans[3]
+    assert tool_span.span_type == SpanType.TOOL
+    assert agent_span.inputs == [{"role": "user", "content": [{"text": "add numbers 1 2 1 2"}]}]
+    assert agent_span.outputs == 3
+    assert tool_span.inputs == {"a": 1, "b": 2}
+    assert tool_span.outputs == [{"json": 3}]
+
+
+def test_multiple_agents_single_trace():
+    mlflow.strands.autolog()
+
+    agent2 = Agent(model=DummyModel("hi"), name="agent2")
+
+    async def sum_and_call_agent2(
+        tool_use: dict[str, Any],
+        **_: Any,
+    ) -> dict[str, Any]:
+        a = tool_use["input"]["a"]
+        b = tool_use["input"]["b"]
+        await agent2.invoke_async("hello")
+        return {
+            "toolUseId": tool_use["toolUseId"],
+            "status": "success",
+            "content": [{"json": a + b}],
+        }
+
+    tool_with_agent2 = PythonAgentTool(
+        "sum",
+        {
+            "name": "sum",
+            "description": "add numbers 1 2",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"a": {"type": "number"}, "b": {"type": "number"}},
+                "required": ["a", "b"],
+            },
+        },
+        sum_and_call_agent2,
+    )
+
+    agent1 = Agent(model=ToolCallingModel("3"), tools=[tool_with_agent2], name="agent1")
+    agent1("add numbers 1 2")
+
+    traces = get_traces()
+    assert len(traces) == 1
+    spans = traces[0].data.spans
+    agent1_span = spans[0]
+    assert agent1_span.name == "invoke_agent agent1"
+    tool_span = spans[3]
+    assert tool_span.span_type == SpanType.TOOL
+    agent2_span = spans[4]
+    assert agent2_span.name == "invoke_agent agent2"
+    assert agent1_span.inputs == [{"role": "user", "content": [{"text": "add numbers 1 2"}]}]
+    assert agent1_span.outputs == 3
+    assert tool_span.inputs == {"a": 1, "b": 2}
+    assert tool_span.outputs == [{"json": 3}]
+    assert agent2_span.inputs == [{"role": "user", "content": [{"text": "hello"}]}]
+    assert agent2_span.outputs.strip() == "hi"
+    # top-level span should contain the sum of both the chat spans. this is set
+    # when we translate the genai semantic conventions into mlflow attributes.
+    assert _core_token_usage(agent1_span.attributes[SpanAttributeKey.CHAT_USAGE]) == {
+        "input_tokens": 2,
+        "output_tokens": 2,
+        "total_tokens": 4,
+    }
+    # agent2 span should contain the token usage for its single chat span
+    assert _core_token_usage(agent2_span.attributes[SpanAttributeKey.CHAT_USAGE]) == {
+        "input_tokens": 1,
+        "output_tokens": 1,
+        "total_tokens": 2,
+    }
+
+
+def test_autolog_disable_prevents_new_traces():
+    mlflow.strands.autolog()
+
+    agent1 = Agent(model=DummyModel("hi"), name="agent1")
+    agent2 = Agent(model=DummyModel("cya"), name="agent2")
+
+    agent1("hello")
+    assert len(get_traces()) == 1
+
+    mlflow.strands.autolog(disable=True)
+    agent2("bye")
+    assert len(get_traces()) == 1
+
+
+def test_autolog_does_not_raise_npe_when_tracing_disabled():
+    mlflow.strands.autolog()
+
+    agent = Agent(model=DummyModel("hi"), name="agent")
+
+    @trace_disabled
+    def run():
+        agent("hello")
+
+    run()
+    assert len(get_traces()) == 0
+
+
+def test_strands_autolog_shared_provider_no_recursion(monkeypatch):
+    # Verify strands.autolog() works with shared tracer provider (no RecursionError)
+    monkeypatch.setenv(MLFLOW_USE_DEFAULT_TRACER_PROVIDER.name, "false")
+
+    mlflow.strands.autolog()
+
+    agent = Agent(model=DummyModel("hi"), name="agent")
+    agent("hello")
+
+    traces = get_traces()
+    assert len(traces) == 1
+    spans = traces[0].data.spans
+    agent_span = next(span for span in spans if span.span_type == SpanType.AGENT)
+    assert agent_span.inputs == [{"role": "user", "content": [{"text": "hello"}]}]
+    assert agent_span.outputs.strip() == "hi"
+
+
+@pytest.mark.parametrize("init_tracing_before_autolog", [False, True])
+def test_strands_autolog_shared_provider_exports_each_span_once(
+    monkeypatch, init_tracing_before_autolog
+):
+    monkeypatch.setenv(MLFLOW_USE_DEFAULT_TRACER_PROVIDER.name, "false")
+
+    if init_tracing_before_autolog:
+        # Registers MLflow's span processor on the shared provider before Strands' processor.
+        with mlflow.start_span(name="warmup"):
+            pass
+
+    mlflow.strands.autolog()
+
+    # Every processor on the shared provider sees what MLflow's processor sees, so an
+    # in-memory exporter there records each span once per dispatch.
+    exporter = InMemorySpanExporter()
+    otel_trace.get_tracer_provider().add_span_processor(SimpleSpanProcessor(exporter))
+
+    agent = Agent(model=DummyModel("hi"), name="agent")
+    agent("hello")
+    with mlflow.start_span(name="manual"):
+        pass
+
+    span_ids = [span.context.span_id for span in exporter.get_finished_spans()]
+    assert len(span_ids) == len(set(span_ids))
+
+    agent_trace = next(t for t in get_traces() if t.data.spans[0].name == "invoke_agent agent")
+    agent_span = next(s for s in agent_trace.data.spans if s.span_type == SpanType.AGENT)
+    assert agent_span.inputs == [{"role": "user", "content": [{"text": "hello"}]}]
+    assert agent_span.outputs.strip() == "hi"
+
+
+def test_strands_autolog_shared_provider_skips_foreign_span(monkeypatch):
+    monkeypatch.setenv(MLFLOW_USE_DEFAULT_TRACER_PROVIDER.name, "false")
+
+    mlflow.strands.autolog()
+
+    parent = otel_trace.SpanContext(
+        trace_id=0x1234567890ABCDEF1234567890ABCDEF,
+        span_id=0x1234567890ABCDEF,
+        is_remote=True,
+        trace_flags=otel_trace.TraceFlags(otel_trace.TraceFlags.SAMPLED),
+    )
+    context = otel_trace.set_span_in_context(otel_trace.NonRecordingSpan(parent))
+
+    tracer = otel_trace.get_tracer("external")
+    with tracer.start_as_current_span("foreign-server-span", context=context):
+        pass
+
+    assert not get_traces()

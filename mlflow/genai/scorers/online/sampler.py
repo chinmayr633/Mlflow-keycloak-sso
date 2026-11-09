@@ -1,0 +1,163 @@
+"""Dense sampling strategy for online scoring."""
+
+import hashlib
+import logging
+from collections import defaultdict
+from typing import TYPE_CHECKING
+
+from mlflow.genai.scorers.base import (
+    SCORER_BACKEND_TRACKING,
+    Scorer,
+    ScorerSamplingConfig,
+    SerializedScorer,
+    _is_decorator_scorer,
+    _serialized_scorer_is_custom_code,
+)
+from mlflow.genai.scorers.scorer_utils import _parse_serialized_scorer
+
+if TYPE_CHECKING:
+    from mlflow.genai.scorers.online.entities import OnlineScorer
+
+_logger = logging.getLogger(__name__)
+
+
+class OnlineScorerSampler:
+    """
+    Samples scorers for traces using dense sampling strategy.
+
+    Dense sampling ensures traces that are selected get thorough coverage:
+    - Sort scorers by sample_rate descending
+    - Use conditional probability: if a scorer is rejected, skip all lower-rate scorers
+    """
+
+    def __init__(
+        self, online_scorers: list["OnlineScorer"], run_custom_scorers_on_host: bool = True
+    ):
+        """
+        Args:
+            online_scorers: The scorers to sample from.
+            run_custom_scorers_on_host: If False, custom ``@scorer`` scorers are loaded without
+                running their code (which then runs in a job container, see
+                ``OnlineContainerScorer``), and custom scorer ensembles are skipped.
+        """
+        self._online_scorers = online_scorers
+        self._online_scorers_by_name = {s.name: s for s in online_scorers}
+        self._sample_rates: dict[str, float] = {}
+        self._scorers: dict[str, Scorer] = {}
+        for online_scorer in online_scorers:
+            try:
+                scorer = self._load_scorer(online_scorer, run_custom_scorers_on_host)
+                if scorer is None:
+                    continue
+                scorer._set_registration_metadata(
+                    backend=SCORER_BACKEND_TRACKING,
+                    experiment_id=online_scorer.online_config.experiment_id,
+                    sampling_config=ScorerSamplingConfig(
+                        sample_rate=online_scorer.online_config.sample_rate,
+                        filter_string=online_scorer.online_config.filter_string,
+                    ),
+                    scorer_version=online_scorer.scorer_version,
+                )
+                self._sample_rates[scorer.name] = online_scorer.online_config.sample_rate
+                self._scorers[scorer.name] = scorer
+            except Exception as e:
+                _logger.info(
+                    f"Failed to load scorer '{online_scorer.name}'; scorer will be skipped: {e}"
+                )
+
+    @staticmethod
+    def _load_scorer(
+        online_scorer: "OnlineScorer", run_custom_scorers_on_host: bool
+    ) -> Scorer | None:
+        if run_custom_scorers_on_host or not _serialized_scorer_is_custom_code(
+            online_scorer.serialized_scorer
+        ):
+            return Scorer.model_validate_json(online_scorer.serialized_scorer)
+        serialized = SerializedScorer.from_dict(
+            _parse_serialized_scorer(online_scorer.serialized_scorer)
+        )
+        if not _is_decorator_scorer(serialized):
+            _logger.warning(
+                f"Skipping scorer '{online_scorer.name}': ensembles that include custom scorers "
+                "are not supported when custom scorers run in a job container."
+            )
+            return None
+        # Never runs the scorer's code: it runs in a job container instead.
+        return Scorer._deserialize_decorator_scorer_metadata(serialized)
+
+    def online_scorer(self, name: str) -> "OnlineScorer":
+        """The online scorer a sampled scorer was loaded from."""
+        return self._online_scorers_by_name[name]
+
+    def scorer(self, name: str) -> Scorer:
+        """The loaded scorer with this name."""
+        return self._scorers[name]
+
+    def group_scorers_by_filter(self, session_level: bool) -> dict[str | None, list[Scorer]]:
+        """
+        Group scorers by their filter string.
+
+        Args:
+            session_level: If True, return session-level scorers. If False, return trace-level.
+
+        Returns:
+            Dictionary mapping filter_string to list of scorers with that filter.
+        """
+        result: dict[str | None, list[Scorer]] = defaultdict(list)
+        for online_scorer in self._online_scorers:
+            scorer = self._scorers.get(online_scorer.name)
+            if scorer and scorer.is_session_level_scorer == session_level:
+                filter_str = online_scorer.online_config.filter_string
+                result[filter_str].append(scorer)
+        return result
+
+    def sample(self, entity_id: str, scorers: list[Scorer]) -> list[Scorer]:
+        """
+        Apply dense sampling to select scorers for an entity.
+
+        Dense sampling ensures selected entities receive comprehensive evaluation across
+        multiple scorers, rather than spreading scorers thinly across all entities.
+        For example, with two scorers at 50% and 25% sample rates:
+        - 50% of entities get both scorers (dense coverage)
+        - 25% get only the first scorer
+        - 25% get no scorers
+        This enables better comparisons between scorers on the same entities.
+
+        Args:
+            entity_id: The trace ID or session ID to sample for.
+            scorers: List of scorers to sample from.
+
+        Returns:
+            A subset of scorers selected via conditional probability waterfall.
+        """
+        if not scorers:
+            return []
+
+        # Sort by sample rate descending
+        sorted_scorers = sorted(
+            scorers,
+            key=lambda s: self._sample_rates.get(s.name, 0.0),
+            reverse=True,
+        )
+
+        selected = []
+        prev_rate = 1.0
+
+        for scorer in sorted_scorers:
+            rate = self._sample_rates.get(scorer.name, 0.0)
+            conditional_rate = rate / prev_rate if prev_rate > 0 else 0
+
+            # Hash entity_id + scorer name to get deterministic value in [0, 1]
+            hash_input = f"{entity_id}:{scorer.name}"
+            hash_value = int(hashlib.sha256(hash_input.encode()).hexdigest(), 16) / (2**256)
+
+            if hash_value > conditional_rate:
+                break
+
+            selected.append(scorer)
+            prev_rate = rate
+
+        _logger.debug(
+            f"Sampled {len(selected)}/{len(scorers)} scorers for entity {entity_id[:8]}..."
+        )
+        return selected

@@ -1,0 +1,40 @@
+# Keycloak SSO for a self-hosted tracking server
+
+This deployment uses Keycloak OpenID Connect for authentication and MLflow's built-in RBAC store for authorization. Keycloak groups and realm roles map to existing MLflow roles. Define each role's resource permissions in MLflow; Keycloak determines who receives those roles.
+
+
+## Keycloak client
+
+Create a confidential OpenID Connect client with the standard authorization code flow enabled. Set the valid redirect URI to `https://mlflow.example.com/oauth/keycloak/callback`, the valid post-logout redirect URI to `https://mlflow.example.com/`, and the web origin to `https://mlflow.example.com`. Replace the host and include the MLflow static prefix if used.
+
+Add a group membership mapper that puts the `groups` claim into the **ID token**. Ensure role mappers put `realm_access.roles` and, if using client roles, `resource_access.<client-id>.roles` into the ID token. For API bearer tokens, configure an audience mapper so the access token `aud` includes the Keycloak client ID. This implementation accepts RS256-signed tokens only.
+
+## MLflow configuration
+
+Install `mlflow[auth,db]` when using PostgreSQL or MySQL, then set these variables before starting the server:
+
+```bash
+export MLFLOW_AUTH_CONFIG_PATH=/path/to/mlflow/server/auth/keycloak_auth.ini
+export MLFLOW_AUTH_DATABASE_URI='postgresql+psycopg://user:password@rds-host:5432/mlflow_auth'
+export MLFLOW_FLASK_SERVER_SECRET_KEY='a-long-random-static-secret-shared-by-all-workers'
+export MLFLOW_AUTH_ADMIN_PASSWORD='a-long-random-bootstrap-password'
+export MLFLOW_KEYCLOAK_ISSUER='https://keycloak.example.com/realms/mlflow'
+export MLFLOW_KEYCLOAK_CLIENT_ID='mlflow'
+export MLFLOW_KEYCLOAK_CLIENT_SECRET='client-secret-from-keycloak'
+export MLFLOW_KEYCLOAK_PUBLIC_URL='https://mlflow.example.com'
+export MLFLOW_KEYCLOAK_ADMIN_ROLE='client:mlflow-super-admin'
+export MLFLOW_KEYCLOAK_ROLE_MAP='{"group:/data-science":"keycloak:reader","realm:mlflow-editor":{"workspace":"default","role":"keycloak:editor"}}'
+mlflow server --app-name basic-auth --host 0.0.0.0 --allowed-hosts mlflow.example.com
+```
+
+Set `MLFLOW_AUTH_DATABASE_URI` to a shared persistent database for multi-worker or multi-node deployments. It overrides `database_uri` in `keycloak_auth.ini`; when unset, the INI value is used. Configure the MLflow tracking database separately with `MLFLOW_BACKEND_STORE_URI` or `--backend-store-uri`. Use HTTPS for MLflow and Keycloak in production. `MLFLOW_KEYCLOAK_PUBLIC_URL` is the externally visible MLflow URL, including any static prefix, without a trailing slash. Keep the Flask secret key and Keycloak client secret private.
+
+Create the `mlflow-super-admin` **client role on the configured `mlflow` client** and assign it to the first user. Set the Client roles mapper's **Add to ID token** option so the ID token contains `resource_access.mlflow.roles`. On first login, that user becomes an MLflow super admin and can create `keycloak:reader` and `keycloak:editor` roles and assign their MLflow RBAC permissions. A realm role can still be used by setting `MLFLOW_KEYCLOAK_ADMIN_ROLE=realm:mlflow-super-admin`. The bootstrap `admin` account is created for database initialization but cannot log in through the Keycloak-only authentication handler. Keycloak subjects are stored as `keycloak:<sub>` so they cannot inherit a local account's permissions by matching its name.
+
+Role map keys may use `group:<full-group-path>`, `realm:<realm-role>`, or `client:<role-on-the-configured-client>`. A string target names a role in the default workspace; an object target specifies both `workspace` and `role`.
+
+Mappings are reconciled on each browser login. Any assigned role whose name starts with `keycloak:` is managed by Keycloak and removed when it is absent from the next login's claims; leave direct grants and other role names for MLflow-managed access. Changes made in Keycloak take effect when a user signs in again or receives a new token. The browser session lasts until its ID token expires, then the login button appears again. The server does not retain a refresh token.
+
+The MLflow UI does not offer local user creation, deletion, or per-user access editing in this mode. The API also rejects local user creation, changes to Keycloak users' passwords or admin flags, deletion of Keycloak users, and manual assignment of `keycloak:` roles to them. Create RBAC roles and their resource permissions in MLflow, then manage membership in Keycloak.
+
+API clients may send a Keycloak access token as `Authorization: Bearer <token>` after that subject has logged in once to provision the MLflow user. The token must be issued by the configured realm, be unexpired, and have the MLflow client ID as its audience. API bearer tokens do not synchronize roles; browser login does.

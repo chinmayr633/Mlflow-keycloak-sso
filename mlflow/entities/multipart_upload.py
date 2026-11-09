@@ -1,0 +1,77 @@
+from dataclasses import dataclass
+from typing import Any
+
+from mlflow.protos.mlflow_artifacts_pb2 import (
+    CreateMultipartUpload as ProtoCreateMultipartUpload,
+)
+from mlflow.protos.mlflow_artifacts_pb2 import (
+    MultipartUploadCredential as ProtoMultipartUploadCredential,
+)
+from mlflow.protos.mlflow_artifacts_pb2 import (
+    MultipartUploadPart as ProtoMultipartUploadPart,
+)
+
+
+@dataclass
+class MultipartUploadPart:
+    part_number: int
+    etag: str | None
+    url: str | None = None
+
+    @classmethod
+    def from_proto(cls, proto: ProtoMultipartUploadPart) -> "MultipartUploadPart":
+        return cls(
+            proto.part_number,
+            proto.etag or None,
+            proto.url or None,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "part_number": self.part_number,
+            "etag": self.etag,
+            "url": self.url,
+        }
+
+
+@dataclass
+class MultipartUploadCredential:
+    url: str
+    part_number: int
+    headers: dict[str, Any]
+
+    def to_proto(self) -> ProtoMultipartUploadCredential:
+        credential = ProtoMultipartUploadCredential()
+        credential.url = self.url
+        credential.part_number = self.part_number
+        credential.headers.update(self.headers)
+        return credential
+
+    @classmethod
+    def from_dict(cls, dict_: dict[str, Any]) -> "MultipartUploadCredential":
+        return cls(
+            url=dict_["url"],
+            part_number=dict_["part_number"],
+            headers=dict_.get("headers", {}),
+        )
+
+
+@dataclass
+class CreateMultipartUploadResponse:
+    upload_id: str | None
+    credentials: list[MultipartUploadCredential]
+
+    def to_proto(self) -> ProtoCreateMultipartUpload.Response:
+        response = ProtoCreateMultipartUpload.Response()
+        if self.upload_id:
+            response.upload_id = self.upload_id
+        response.credentials.extend([credential.to_proto() for credential in self.credentials])
+        return response
+
+    @classmethod
+    def from_dict(cls, dict_: dict[str, Any]) -> "CreateMultipartUploadResponse":
+        credentials = [MultipartUploadCredential.from_dict(cred) for cred in dict_["credentials"]]
+        return cls(
+            upload_id=dict_.get("upload_id"),
+            credentials=credentials,
+        )

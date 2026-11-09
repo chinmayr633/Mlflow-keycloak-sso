@@ -1,0 +1,364 @@
+import ErrorUtils from '@mlflow/mlflow/src/common/utils/ErrorUtils';
+import { withErrorBoundary } from '@mlflow/mlflow/src/common/utils/withErrorBoundary';
+import { FormattedMessage } from '@mlflow/mlflow/src/i18n/i18n';
+import type { GetTraceFunction } from '@databricks/web-shared/genai-traces-table';
+import {
+  createTraceLocationForExperiment,
+  createTraceLocationForDestinationPath,
+  doesTraceSupportV4API,
+  useGetTraces,
+  useSearchMlflowTraces,
+} from '@databricks/web-shared/genai-traces-table';
+
+import { useParams, useLocation, useNavigate } from '@mlflow/mlflow/src/common/utils/RoutingUtils';
+import { shouldEnableNewEvalRunsUi } from '@mlflow/mlflow/src/common/utils/FeatureUtils';
+import invariant from 'invariant';
+import { useGetExperimentQuery } from '../../../hooks/useExperimentQuery';
+import React, { useCallback, useMemo, useRef, useState, useEffect, useLayoutEffect } from 'react';
+import { ExperimentSingleChatSessionScoreResults } from './ExperimentSingleChatSessionScoreResults';
+import { TracesV3Toolbar } from '../../../components/experiment-page/components/traces-v3/TracesV3Toolbar';
+import type { ModelTrace, ModelTraceInfoV3 } from '@databricks/web-shared/model-trace-explorer';
+import {
+  createTraceV4LongIdentifier,
+  getModelTraceId,
+  isEvaluatingTracesInDetailsViewEnabled,
+  isV3ModelTraceInfo,
+  ModelTraceExplorer,
+  ModelTraceExplorerContextProvider,
+  ModelTraceExplorerDrawer,
+  ModelTraceExplorerRunJudgesContextProvider,
+  ModelTraceExplorerUpdateTraceContextProvider,
+  ModelTraceExplorerPreferencesProvider,
+  shouldEnableAssessmentsInSessions,
+  shouldEnableModelTraceExplorerCustomTraceView,
+  shouldUseTracesV4API,
+} from '@databricks/web-shared/model-trace-explorer';
+import {
+  ExperimentSingleChatSessionSidebar,
+  ExperimentSingleChatSessionSidebarSkeleton,
+} from './ExperimentSingleChatSessionSidebar';
+import { getTrace as getTraceV3 } from '@mlflow/mlflow/src/experiment-tracking/utils/TraceUtils';
+import { getChatSessionsFilter } from '../utils';
+import {
+  ExperimentSingleChatConversation,
+  ExperimentSingleChatConversationSkeleton,
+} from './ExperimentSingleChatConversation';
+import { GenericSkeleton, Spinner, useDesignSystemTheme } from '@databricks/design-system';
+import {
+  SELECTED_TRACE_ID_QUERY_PARAM,
+  TRACE_DRAWER_SESSION_ID_QUERY_PARAM,
+  TRACE_DRAWER_VIEW_MODE_QUERY_PARAM,
+} from '../../../constants';
+import Routes from '../../../routes';
+import { useExperimentSingleChatMetrics } from './useExperimentSingleChatMetrics';
+import { ExperimentSingleChatSessionMetrics } from './ExperimentSingleChatSessionMetrics';
+import { useRegisterAssistantContext } from '@mlflow/mlflow/src/assistant';
+import { ExportTracesToDatasetModal } from '../../experiment-evaluation-datasets/components/ExportTracesToDatasetModal';
+import { AssistantAwareDrawer } from '@mlflow/mlflow/src/common/components/AssistantAwareDrawer';
+import { first } from 'lodash';
+import { useRunScorerInTracesViewConfiguration } from '../../experiment-scorers/hooks/useRunScorerInTracesViewConfiguration';
+import { useOptionalCustomViewDefinition } from '@databricks/web-shared/model-trace-explorer/custom-view/CustomViewDefinitionContext';
+
+// Custom View pulls in @a2ui (ESM-only) transitively via ExperimentCustomViewProvider.
+// Lazy-load it so the chat-session route only pulls @a2ui into the graph when enabled.
+const LazyExperimentCustomViewProvider = React.lazy(() =>
+  import('../../../components/experiment-page/components/traces-v3/ExperimentCustomViewProvider').then((module) => ({
+    default: module.ExperimentCustomViewProvider,
+  })),
+);
+
+const ContextProviders = ({
+  children,
+  experimentId,
+  invalidateTraceQuery,
+}: {
+  children: React.ReactNode;
+  experimentId: string;
+  invalidateTraceQuery?: (traceId?: string) => void;
+}) => {
+  const renderCustomExportTracesToDatasetsModal = ExportTracesToDatasetModal;
+  const DrawerComponent = AssistantAwareDrawer;
+  const existingCustomViewDefinition = useOptionalCustomViewDefinition();
+  const content =
+    shouldEnableModelTraceExplorerCustomTraceView() && existingCustomViewDefinition === undefined ? (
+      <React.Suspense fallback={<GenericSkeleton css={{ flex: 1, margin: 16 }} />}>
+        <LazyExperimentCustomViewProvider key={experimentId} experimentId={experimentId}>
+          {children}
+        </LazyExperimentCustomViewProvider>
+      </React.Suspense>
+    ) : (
+      children
+    );
+
+  return (
+    <ModelTraceExplorerPreferencesProvider>
+      <ModelTraceExplorerContextProvider
+        renderExportTracesToDatasetsModal={renderCustomExportTracesToDatasetsModal}
+        DrawerComponent={DrawerComponent}
+      >
+        <ModelTraceExplorerUpdateTraceContextProvider invalidateTraceQuery={invalidateTraceQuery}>
+          {content}
+        </ModelTraceExplorerUpdateTraceContextProvider>
+      </ModelTraceExplorerContextProvider>
+    </ModelTraceExplorerPreferencesProvider>
+  );
+};
+
+const ExperimentSingleChatSessionPageImpl = () => {
+  const { theme } = useDesignSystemTheme();
+  const { experimentId, sessionId } = useParams();
+  const location = useLocation();
+  const [selectedTurnIndex, setSelectedTurnIndex] = useState<number | null>(null);
+  const [selectedTrace, setSelectedTrace] = useState<ModelTrace | null>(null);
+  const chatRefs = useRef<{ [traceId: string]: HTMLDivElement }>({});
+
+  invariant(experimentId, 'Experiment ID must be defined');
+  invariant(sessionId, 'Session ID must be defined');
+
+  useRegisterAssistantContext('sessionId', sessionId);
+  useRegisterAssistantContext('traceId', selectedTrace ? getModelTraceId(selectedTrace) : null);
+
+  const selectedTraceIdFromUrl = useMemo(() => {
+    const searchParams = new URLSearchParams(location.search);
+    return searchParams.get(SELECTED_TRACE_ID_QUERY_PARAM);
+  }, [location.search]);
+
+  const { loading: isLoadingExperiment } = useGetExperimentQuery({
+    experimentId,
+  });
+
+  const traceSearchLocations = useMemo(
+    () => {
+      return [createTraceLocationForExperiment(experimentId)];
+    },
+    // prettier-ignore
+    [
+      experimentId,
+    ],
+  );
+
+  const filters = useMemo(() => getChatSessionsFilter({ sessionId }), [sessionId]);
+
+  const { data: traceInfos, isLoading: isLoadingTraceInfos } = useSearchMlflowTraces({
+    locations: traceSearchLocations,
+    filters,
+    disabled: false,
+  });
+
+  const sortedTraceInfos = useMemo(() => {
+    return traceInfos?.sort((a, b) => new Date(a.request_time).getTime() - new Date(b.request_time).getTime());
+  }, [traceInfos]);
+
+  const chatSessionMetrics = useExperimentSingleChatMetrics({ traceInfos: sortedTraceInfos });
+
+  const getTrace = getTraceV3;
+  const getAssessmentTitle = useCallback((assessmentName: string) => assessmentName, []);
+  const {
+    data: traces,
+    isLoading: isLoadingTraceDatas,
+    invalidateSingleTraceQuery,
+  } = useGetTraces(getTrace, sortedTraceInfos);
+
+  useEffect(() => {
+    if (selectedTraceIdFromUrl && traces && traces.length > 0 && !isLoadingTraceDatas) {
+      const traceIndex = traces.findIndex((trace) => getModelTraceId(trace) === selectedTraceIdFromUrl);
+      if (traceIndex !== -1) {
+        setSelectedTurnIndex(traceIndex);
+        const traceRef = chatRefs.current[selectedTraceIdFromUrl];
+        if (traceRef) {
+          traceRef.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
+      }
+    }
+  }, [selectedTraceIdFromUrl, traces, isLoadingTraceDatas]);
+
+  return (
+    <ContextProviders
+      // prettier-ignore
+      experimentId={experimentId}
+      invalidateTraceQuery={invalidateSingleTraceQuery}
+    >
+      <div css={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}>
+        <TracesV3Toolbar
+          // prettier-ignore
+          viewState="single-chat-session"
+          sessionId={sessionId}
+          css={
+            shouldEnableAssessmentsInSessions()
+              ? {
+                  borderBottom: 'none',
+                }
+              : undefined
+          }
+        />
+
+        {shouldEnableAssessmentsInSessions() && (
+          <ExperimentSingleChatSessionMetrics chatSessionMetrics={chatSessionMetrics} />
+        )}
+        {isLoadingTraceDatas || isLoadingTraceInfos ? (
+          <div css={{ display: 'flex', flex: 1, minHeight: 0 }}>
+            <ExperimentSingleChatSessionSidebarSkeleton />
+            <ExperimentSingleChatConversationSkeleton />
+          </div>
+        ) : (
+          <div css={{ display: 'flex', flex: 1, minHeight: 0 }}>
+            <ExperimentSingleChatSessionSidebar
+              traces={traces ?? []}
+              selectedTurnIndex={selectedTurnIndex}
+              setSelectedTurnIndex={setSelectedTurnIndex}
+              setSelectedTrace={setSelectedTrace}
+              chatRefs={chatRefs}
+            />
+            <ExperimentSingleChatConversation
+              traces={traces ?? []}
+              selectedTurnIndex={selectedTurnIndex}
+              setSelectedTurnIndex={setSelectedTurnIndex}
+              setSelectedTrace={setSelectedTrace}
+              chatRefs={chatRefs}
+              getAssessmentTitle={getAssessmentTitle}
+            />
+            {shouldEnableAssessmentsInSessions() && (
+              <ExperimentSingleChatSessionScoreResults
+                traces={traces ?? []}
+                sessionId={sessionId}
+                onRefreshSession={() => {
+                  const rootTrace = first(sortedTraceInfos);
+                  if (rootTrace) {
+                    // The first trace contains the assessments for the session
+                    invalidateSingleTraceQuery(rootTrace.trace_id);
+                  }
+                }}
+              />
+            )}
+          </div>
+        )}
+        {selectedTrace !== null && selectedTurnIndex !== null && (
+          <ModelTraceExplorerDrawer
+            handleClose={() => setSelectedTrace(null)}
+            selectPreviousEval={() => {
+              if (selectedTurnIndex > 0 && traces) {
+                const prevIndex = selectedTurnIndex - 1;
+                setSelectedTurnIndex(prevIndex);
+                setSelectedTrace(traces[prevIndex]);
+              }
+            }}
+            selectNextEval={() => {
+              if (traces && selectedTurnIndex < traces.length - 1) {
+                const nextIndex = selectedTurnIndex + 1;
+                setSelectedTurnIndex(nextIndex);
+                setSelectedTrace(traces[nextIndex]);
+              }
+            }}
+            isPreviousAvailable={selectedTurnIndex > 0}
+            isNextAvailable={traces !== undefined && selectedTurnIndex < traces.length - 1}
+            renderModalTitle={() => getModelTraceId(selectedTrace)}
+            experimentId={experimentId}
+            traceInfo={
+              sortedTraceInfos?.[selectedTurnIndex] && isV3ModelTraceInfo(sortedTraceInfos[selectedTurnIndex])
+                ? (sortedTraceInfos[selectedTurnIndex] as ModelTraceInfoV3)
+                : undefined
+            }
+          >
+            <div
+              css={{
+                height: '100%',
+                display: 'flex',
+                flexDirection: 'column',
+                marginLeft: -theme.spacing.lg,
+                marginRight: -theme.spacing.lg,
+                marginBottom: -theme.spacing.lg,
+              }}
+            >
+              {isEvaluatingTracesInDetailsViewEnabled() ? (
+                <JudgeContextProviderForTrace>
+                  <ModelTraceExplorer modelTrace={selectedTrace} collapseAssessmentPane="force-open" />
+                </JudgeContextProviderForTrace>
+              ) : (
+                <ModelTraceExplorer modelTrace={selectedTrace} collapseAssessmentPane="force-open" />
+              )}
+            </div>
+          </ModelTraceExplorerDrawer>
+        )}
+      </div>
+    </ContextProviders>
+  );
+};
+
+/** The trace to open with the session: the linked one if it belongs to it, otherwise the first turn. */
+export const findSessionRedirectTrace = (traceInfos: ModelTraceInfoV3[], selectedTraceId: string | null) =>
+  traceInfos.find(
+    (traceInfo) =>
+      traceInfo.trace_id === selectedTraceId ||
+      (doesTraceSupportV4API(traceInfo) && createTraceV4LongIdentifier(traceInfo) === selectedTraceId),
+  ) ?? [...traceInfos].sort((left, right) => Date.parse(left.request_time) - Date.parse(right.request_time))[0];
+
+/**
+ * With the new evaluation runs UI, a session opens in the Traces tab's drawer, grouped by session, so
+ * this route sends the link there and keeps the parameters it came with.
+ */
+const ExperimentSingleChatSessionRedirect = () => {
+  const { experimentId, sessionId } = useParams();
+  const { search, hash } = useLocation();
+  const navigate = useNavigate();
+
+  invariant(experimentId, 'Experiment ID must be defined');
+  invariant(sessionId, 'Session ID must be defined');
+
+  const selectedTraceId = useMemo(() => new URLSearchParams(search).get(SELECTED_TRACE_ID_QUERY_PARAM), [search]);
+  const locations = useMemo(() => [createTraceLocationForExperiment(experimentId)], [experimentId]);
+  const filters = useMemo(() => getChatSessionsFilter({ sessionId }), [sessionId]);
+  const { data: traceInfos, isLoading } = useSearchMlflowTraces({ locations, filters });
+
+  useLayoutEffect(() => {
+    if (isLoading || traceInfos === undefined) {
+      return;
+    }
+    const selectedTrace = findSessionRedirectTrace(traceInfos, selectedTraceId);
+    const searchParams = new URLSearchParams(search);
+    searchParams.delete(SELECTED_TRACE_ID_QUERY_PARAM);
+    searchParams.set('groupBy', 'session');
+    searchParams.set('startTimeLabel', 'ALL');
+    searchParams.set(TRACE_DRAWER_VIEW_MODE_QUERY_PARAM, 'session');
+    searchParams.set(TRACE_DRAWER_SESSION_ID_QUERY_PARAM, sessionId);
+    if (selectedTrace) {
+      searchParams.set(
+        'traceId',
+        doesTraceSupportV4API(selectedTrace) ? createTraceV4LongIdentifier(selectedTrace) : selectedTrace.trace_id,
+      );
+    } else {
+      searchParams.delete('traceId');
+    }
+    navigate(`${Routes.getExperimentPageTracesTabRoute(experimentId)}?${searchParams.toString()}${hash}`, {
+      replace: true,
+    });
+  }, [experimentId, hash, isLoading, navigate, search, selectedTraceId, sessionId, traceInfos]);
+
+  return (
+    <div css={{ display: 'flex', flex: 1, alignItems: 'center', justifyContent: 'center' }}>
+      <Spinner />
+    </div>
+  );
+};
+
+const ExperimentSingleChatSessionPageEntrypoint = () =>
+  shouldEnableNewEvalRunsUi() ? <ExperimentSingleChatSessionRedirect /> : <ExperimentSingleChatSessionPageImpl />;
+
+const ExperimentSingleChatSessionPage = withErrorBoundary(
+  ErrorUtils.mlflowServices.CHAT_SESSIONS,
+  ExperimentSingleChatSessionPageEntrypoint,
+  <FormattedMessage
+    defaultMessage="An error occurred while rendering the chat session."
+    description="Generic error message for uncaught errors when rendering a single chat session in MLflow experiment page"
+  />,
+);
+
+const JudgeContextProviderForTrace = ({ children }: { children: React.ReactNode }) => {
+  const runJudgeConfiguration = useRunScorerInTracesViewConfiguration();
+  return (
+    <ModelTraceExplorerRunJudgesContextProvider {...runJudgeConfiguration}>
+      {children}
+    </ModelTraceExplorerRunJudgesContextProvider>
+  );
+};
+
+export default ExperimentSingleChatSessionPage;

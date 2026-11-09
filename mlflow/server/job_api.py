@@ -1,0 +1,173 @@
+"""
+Internal job APIs for UI invocation
+"""
+
+import json
+from typing import Any
+
+from fastapi import APIRouter, HTTPException, Request
+from pydantic import BaseModel
+
+from mlflow.entities._job import Job as JobEntity
+from mlflow.entities._job import JobProgress
+from mlflow.entities._job_status import JobStatus
+from mlflow.exceptions import MlflowException
+
+job_api_router = APIRouter(prefix="/ajax-api/3.0/jobs", tags=["Job"])
+
+
+class JobProgressResponse(BaseModel):
+    """
+    Pydantic model for structured job progress.
+    """
+
+    phase: str | None = None
+    completed: int | None = None
+    total: int | None = None
+    unit: str | None = None
+
+    @classmethod
+    def from_job_progress(cls, progress: JobProgress) -> "JobProgressResponse":
+        return cls(
+            phase=progress.phase,
+            completed=progress.completed,
+            total=progress.total,
+            unit=progress.unit,
+        )
+
+
+class Job(BaseModel):
+    """
+    Pydantic model for job query response.
+    """
+
+    job_id: str
+    creation_time: int
+    job_name: str
+    params: dict[str, Any]
+    timeout: float | None
+    status: JobStatus
+    result: Any
+    error_message: str | None = None
+    retry_count: int
+    last_update_time: int
+    status_details: dict[str, Any] | None = None
+    creator: str | None = None
+    status_message: str | None = None
+    progress: JobProgressResponse | None = None
+    progress_updated_at: int | None = None
+
+    @classmethod
+    def from_job_entity(cls, job: JobEntity) -> "Job":
+        return cls(
+            job_id=job.job_id,
+            creation_time=job.creation_time,
+            job_name=job.job_name,
+            params=json.loads(job.params),
+            timeout=job.timeout,
+            status=job.status,
+            result=job.parsed_result,
+            error_message=job.error_message,
+            retry_count=job.retry_count,
+            last_update_time=job.last_update_time,
+            status_details=job.status_details,
+            creator=job.creator,
+            status_message=job.status_message,
+            progress=(
+                JobProgressResponse.from_job_progress(job.progress)
+                if isinstance(job.progress, JobProgress)
+                else None
+            ),
+            progress_updated_at=job.progress_updated_at,
+        )
+
+
+@job_api_router.get("/{job_id}", response_model=Job)
+def get_job(job_id: str) -> Job:
+    from mlflow.server.jobs import get_job
+
+    try:
+        job = get_job(job_id)
+        return Job.from_job_entity(job)
+    except MlflowException as e:
+        raise HTTPException(
+            status_code=e.get_http_status_code(),
+            detail=e.message,
+        )
+
+
+class SubmitJobPayload(BaseModel):
+    job_name: str
+    params: dict[str, Any]
+    timeout: float | None = None
+
+
+@job_api_router.post("/", response_model=Job)
+def submit_job(payload: SubmitJobPayload, request: Request) -> Job:
+    from mlflow.server.jobs import submit_job
+    from mlflow.server.jobs.utils import _load_function, get_job_fn_fullname
+
+    job_name = payload.job_name
+    # Record the caller (stamped on request.state by the middleware; flask.g isn't populated
+    # there) as the job creator, so ownership checks on get/cancel recognize the submitter.
+    creator = getattr(request.state, "username", None)
+    try:
+        function_fullname = get_job_fn_fullname(job_name)
+        function = _load_function(function_fullname)
+        job = submit_job(function, payload.params, payload.timeout, creator=creator)
+        return Job.from_job_entity(job)
+    except MlflowException as e:
+        raise HTTPException(
+            status_code=e.get_http_status_code(),
+            detail=e.message,
+        )
+
+
+@job_api_router.patch("/cancel/{job_id}", response_model=Job)
+def cancel_job(job_id: str) -> Job:
+    from mlflow.server.jobs import cancel_job
+
+    try:
+        job = cancel_job(job_id)
+        return Job.from_job_entity(job)
+    except MlflowException as e:
+        raise HTTPException(
+            status_code=e.get_http_status_code(),
+            detail=e.message,
+        )
+
+
+class SearchJobPayload(BaseModel):
+    job_name: str | None = None
+    params: dict[str, Any] | None = None
+    statuses: list[JobStatus] | None = None
+
+
+class SearchJobsResponse(BaseModel):
+    """
+    Pydantic model for job searching response.
+    """
+
+    jobs: list[Job]
+
+
+@job_api_router.post("/search", response_model=SearchJobsResponse)
+def search_jobs(payload: SearchJobPayload) -> SearchJobsResponse:
+    from mlflow.server.handlers import _get_job_store
+
+    try:
+        store = _get_job_store()
+        job_results = [
+            Job.from_job_entity(job)
+            for job in store.list_jobs(
+                job_name=payload.job_name,
+                statuses=payload.statuses,
+                params=payload.params,
+            )
+        ]
+        return SearchJobsResponse(jobs=job_results)
+    except MlflowException as e:
+        raise HTTPException(
+            status_code=e.get_http_status_code(),
+            detail=e.message,
+        )

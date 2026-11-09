@@ -1,0 +1,503 @@
+import {
+  Button,
+  ChevronDownIcon,
+  ColumnsIcon,
+  Input,
+  Popover,
+  SearchIcon,
+  Tree,
+  useDesignSystemTheme,
+} from '@databricks/design-system';
+import { Theme } from '@emotion/react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { FormattedMessage } from 'react-intl';
+import { useMediaQuery } from '@databricks/web-shared/hooks';
+import Utils from '../../../../../common/utils/Utils';
+import { ATTRIBUTE_COLUMN_LABELS, COLUMN_TYPES } from '../../../../constants';
+import { useUpdateExperimentViewUIState } from '../../contexts/ExperimentPageUIStateContext';
+import { useExperimentIds } from '../../hooks/useExperimentIds';
+import type { ExperimentPageUIState } from '../../models/ExperimentPageUIState';
+import {
+  extractCanonicalSortKey,
+  isCanonicalSortKeyOfType,
+  makeCanonicalSortKey,
+} from '../../utils/experimentPage.common-utils';
+import type { ExperimentRunsSelectorResult } from '../../utils/experimentRuns.selector';
+import { customMetricBehaviorDefs } from '../../utils/customMetricBehaviorUtils';
+
+/**
+ * We need to recreate antd's tree check callback signature since it's not importable
+ */
+type AntdTreeCheckCallback = { node: { key: string | number; checked: boolean } };
+
+/**
+ * Function localizing antd tree inside a DOM element. Used to focusing by keyboard.
+ */
+const locateAntdTree = (parent: HTMLElement | null): HTMLElement | null =>
+  parent?.querySelector('[role="tree"] input') || null;
+
+const GROUP_KEY = 'GROUP';
+
+const GROUP_KEY_ATTRIBUTES = makeCanonicalSortKey(GROUP_KEY, COLUMN_TYPES.ATTRIBUTES);
+const GROUP_KEY_PARAMS = makeCanonicalSortKey(GROUP_KEY, COLUMN_TYPES.PARAMS);
+const GROUP_KEY_METRICS = makeCanonicalSortKey(GROUP_KEY, COLUMN_TYPES.METRICS);
+const GROUP_KEY_TAGS = makeCanonicalSortKey(GROUP_KEY, COLUMN_TYPES.TAGS);
+
+// Tree row height from design-system Tree. The previous selector capped the list
+// at 15 rows and otherwise shrink-wrapped, so a one-result search stayed short.
+const TREE_ROW_HEIGHT = 32;
+const MAX_VISIBLE_TREE_ROWS = 15;
+const DEFAULT_TREE_MAX_HEIGHT = MAX_VISIBLE_TREE_ROWS * TREE_ROW_HEIGHT;
+const DEFAULT_PANEL_WIDTH = 400;
+// Native CSS resize grip hit target in the panel's bottom-right corner.
+const RESIZE_GRIP_SIZE = 16;
+
+/**
+ * Returns all usable attribute columns basing on view mode and enabled flagged features
+ */
+const getAttributeColumns = (isComparing: boolean) => {
+  const result = [
+    ATTRIBUTE_COLUMN_LABELS.USER,
+    ATTRIBUTE_COLUMN_LABELS.SOURCE,
+    ATTRIBUTE_COLUMN_LABELS.VERSION,
+    ATTRIBUTE_COLUMN_LABELS.MODELS,
+    ATTRIBUTE_COLUMN_LABELS.DESCRIPTION,
+  ];
+
+  if (isComparing) {
+    result.unshift(ATTRIBUTE_COLUMN_LABELS.EXPERIMENT_NAME);
+  }
+
+  result.unshift(ATTRIBUTE_COLUMN_LABELS.DATASET);
+
+  return result;
+};
+
+/**
+ * Function filters list of string by a given query string.
+ */
+const findMatching = (values: string[], filterQuery: string) =>
+  values.filter((v) => v.toLowerCase().includes(filterQuery.toLowerCase()));
+
+/**
+ * Function dissects given string and wraps the
+ * searched query with <strong>...</strong> if found. Used for highlighting search.
+ */
+const createHighlightedNode = (value: string, filterQuery: string) => {
+  if (!filterQuery) {
+    return value;
+  }
+  const index = value.toLowerCase().indexOf(filterQuery.toLowerCase());
+  const beforeStr = value.substring(0, index);
+  const matchStr = value.substring(index, index + filterQuery.length);
+  const afterStr = value.substring(index + filterQuery.length);
+
+  return index > -1 ? (
+    <span>
+      {beforeStr}
+      <strong>{matchStr}</strong>
+      {afterStr}
+    </span>
+  ) : (
+    value
+  );
+};
+export interface ExperimentViewRunsColumnSelectorProps {
+  runsData: ExperimentRunsSelectorResult;
+  columnSelectorVisible: boolean;
+  onChangeColumnSelectorVisible: (value: boolean) => void;
+  selectedColumns: string[];
+  onResetColumns: () => void;
+}
+
+/**
+ * A component displaying the searchable column list - implementation.
+ */
+export const ExperimentViewRunsColumnSelector = React.memo(
+  // eslint-disable-next-line react-component-name/react-component-name -- TODO(FEINF-4716)
+  ({
+    runsData,
+    columnSelectorVisible,
+    onChangeColumnSelectorVisible,
+    selectedColumns,
+    onResetColumns,
+  }: ExperimentViewRunsColumnSelectorProps) => {
+    const updateUIState = useUpdateExperimentViewUIState();
+    const experimentIds = useExperimentIds();
+    const [filter, setFilter] = useState('');
+    const { theme } = useDesignSystemTheme();
+    // Matches design-system `theme.responsive.mediaQueries.xs` (max-width: 575.98px).
+    const isXsViewport = useMediaQuery('(max-width: 575.98px)');
+
+    const searchInputRef = useRef<any>(null);
+    const scrollableContainerRef = useRef<HTMLDivElement>(null);
+    const buttonRef = useRef<HTMLButtonElement>(null);
+    const panelRef = useRef<HTMLDivElement>(null);
+    const resizePointerUpRef = useRef<(() => void) | null>(null);
+    // Null until the user drags the resize grip. While null, the panel
+    // shrink-wraps its content (tree capped at 15 rows) instead of a fixed height.
+    const [userPanelSize, setUserPanelSize] = useState<{ width: number; height: number } | null>(null);
+
+    // Extract all attribute columns
+    const attributeColumnNames = useMemo(() => getAttributeColumns(experimentIds.length > 1), [experimentIds.length]);
+
+    const setCheckedColumns = useCallback(
+      (updateFn: (existingCheckedColumns: string[]) => string[]) =>
+        updateUIState((facets: ExperimentPageUIState) => {
+          const newColumns = updateFn(facets.selectedColumns);
+          const uniqueNewColumns = Array.from(new Set(newColumns));
+          return { ...facets, selectedColumns: uniqueNewColumns };
+        }),
+      [updateUIState],
+    );
+
+    // Extract unique list of tags
+    const tagsKeyList = useMemo(() => Utils.getVisibleTagKeyList(runsData.tagsList), [runsData]);
+
+    // Extract canonical key names for attributes, params, metrics and tags.
+    const canonicalKeyNames = useMemo(
+      () => ({
+        [COLUMN_TYPES.ATTRIBUTES]: attributeColumnNames.map((key) =>
+          makeCanonicalSortKey(COLUMN_TYPES.ATTRIBUTES, key),
+        ),
+        [COLUMN_TYPES.PARAMS]: runsData.paramKeyList.map((key) => makeCanonicalSortKey(COLUMN_TYPES.PARAMS, key)),
+        [COLUMN_TYPES.METRICS]: runsData.metricKeyList.map((key) => makeCanonicalSortKey(COLUMN_TYPES.METRICS, key)),
+        [COLUMN_TYPES.TAGS]: tagsKeyList.map((key) => makeCanonicalSortKey(COLUMN_TYPES.TAGS, key)),
+      }),
+      [runsData, attributeColumnNames, tagsKeyList],
+    );
+
+    // This memoized value holds the tree structure generated from
+    // attributes, params, metrics and tags. Displays only filtered values.
+    const treeData = useMemo(() => {
+      const result = [];
+
+      const filteredAttributes = findMatching(attributeColumnNames, filter);
+      const filteredParams = findMatching(runsData.paramKeyList, filter);
+      const filteredMetrics = findMatching(runsData.metricKeyList, filter);
+      const filteredTags = findMatching(tagsKeyList, filter);
+
+      if (filteredAttributes.length) {
+        result.push({
+          key: GROUP_KEY_ATTRIBUTES,
+          title: `Attributes`,
+          children: filteredAttributes.map((attributeKey) => ({
+            key: makeCanonicalSortKey(COLUMN_TYPES.ATTRIBUTES, attributeKey),
+            title: createHighlightedNode(attributeKey, filter),
+          })),
+        });
+      }
+      if (filteredMetrics.length) {
+        result.push({
+          key: GROUP_KEY_METRICS,
+          title: `Metrics (${filteredMetrics.length})`,
+          children: filteredMetrics.map((metricKey) => {
+            const customColumnDef = customMetricBehaviorDefs[metricKey];
+            return {
+              key: makeCanonicalSortKey(COLUMN_TYPES.METRICS, metricKey),
+              title: createHighlightedNode(customColumnDef?.displayName ?? metricKey, filter),
+            };
+          }),
+        });
+      }
+      if (filteredParams.length) {
+        result.push({
+          key: GROUP_KEY_PARAMS,
+          title: `Parameters (${filteredParams.length})`,
+          children: filteredParams.map((paramKey) => ({
+            key: makeCanonicalSortKey(COLUMN_TYPES.PARAMS, paramKey),
+            title: createHighlightedNode(paramKey, filter),
+          })),
+        });
+      }
+      if (filteredTags.length) {
+        result.push({
+          key: GROUP_KEY_TAGS,
+          title: `Tags (${filteredTags.length})`,
+          children: filteredTags.map((tagKey) => ({
+            key: makeCanonicalSortKey(COLUMN_TYPES.TAGS, tagKey),
+            title: tagKey,
+          })),
+        });
+      }
+
+      return result;
+    }, [attributeColumnNames, filter, runsData, tagsKeyList]);
+
+    // This callback toggles entire group of keys
+    const toggleGroup = useCallback(
+      (isChecked: boolean, keyList: string[]) => {
+        if (!isChecked) {
+          setCheckedColumns((checked) => [...checked, ...keyList]);
+        } else {
+          setCheckedColumns((checked) => checked.filter((k) => !keyList.includes(k)));
+        }
+      },
+      [setCheckedColumns],
+    );
+
+    // This callback is intended to select/deselect a single key
+    const toggleSingleKey = useCallback(
+      (key: string, isChecked: boolean) => {
+        if (!isChecked) {
+          setCheckedColumns((checked) => [...checked, key]);
+        } else {
+          setCheckedColumns((checked) => checked.filter((k) => k !== key));
+        }
+      },
+      [setCheckedColumns],
+    );
+
+    useEffect(() => {
+      if (!columnSelectorVisible) {
+        setUserPanelSize(null);
+      }
+    }, [columnSelectorVisible]);
+
+    useEffect(() => {
+      return () => {
+        if (resizePointerUpRef.current) {
+          window.removeEventListener('pointerup', resizePointerUpRef.current);
+        }
+      };
+    }, []);
+
+    const onPanelResizePointerDown = useCallback(
+      (event: React.PointerEvent<HTMLDivElement>) => {
+        if (isXsViewport) {
+          return;
+        }
+        const panel = panelRef.current;
+        if (!panel) {
+          return;
+        }
+        const rect = panel.getBoundingClientRect();
+        const onGrip =
+          event.clientX >= rect.right - RESIZE_GRIP_SIZE && event.clientY >= rect.bottom - RESIZE_GRIP_SIZE;
+        if (!onGrip) {
+          return;
+        }
+
+        const startWidth = rect.width;
+        const startHeight = rect.height;
+        if (resizePointerUpRef.current) {
+          window.removeEventListener('pointerup', resizePointerUpRef.current);
+        }
+        const handlePointerUp = () => {
+          window.removeEventListener('pointerup', handlePointerUp);
+          if (resizePointerUpRef.current === handlePointerUp) {
+            resizePointerUpRef.current = null;
+          }
+          const nextRect = panelRef.current?.getBoundingClientRect();
+          if (!nextRect) {
+            return;
+          }
+          if (Math.abs(nextRect.width - startWidth) <= 1 && Math.abs(nextRect.height - startHeight) <= 1) {
+            return;
+          }
+          setUserPanelSize({ width: nextRect.width, height: nextRect.height });
+        };
+        resizePointerUpRef.current = handlePointerUp;
+        window.addEventListener('pointerup', handlePointerUp);
+      },
+      [isXsViewport],
+    );
+
+    useEffect(() => {
+      if (columnSelectorVisible) {
+        setFilter('');
+
+        // Let's wait for the next execution frame, then:
+        // - restore the dropdown menu scroll position
+        // - focus the search input
+        // - bring the dropdown into the viewport using scrollIntoView()
+        requestAnimationFrame(() => {
+          scrollableContainerRef?.current?.scrollTo(0, 0);
+          searchInputRef.current?.focus({ preventScroll: true });
+
+          if (buttonRef.current) {
+            buttonRef.current.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+          }
+        });
+      }
+    }, [columnSelectorVisible]);
+
+    const onCheck = useCallback(
+      // We need to recreate antd's tree check callback signature
+      (_: any, { node: { key, checked } }: AntdTreeCheckCallback) => {
+        if (isCanonicalSortKeyOfType(key.toString(), GROUP_KEY)) {
+          const columnType = extractCanonicalSortKey(key.toString(), GROUP_KEY);
+          const canonicalKeysForGroup = canonicalKeyNames[columnType];
+          if (canonicalKeysForGroup) {
+            toggleGroup(checked, findMatching(canonicalKeysForGroup, filter));
+          }
+        } else {
+          toggleSingleKey(key.toString(), checked);
+        }
+      },
+      [canonicalKeyNames, toggleGroup, toggleSingleKey, filter],
+    );
+
+    // This callback moves focus to tree element if down arrow has been pressed
+    // when inside search input area.
+    const searchInputKeyDown = useCallback<React.KeyboardEventHandler<HTMLInputElement>>((e) => {
+      if (e.key === 'ArrowDown') {
+        const treeElement = locateAntdTree(scrollableContainerRef.current);
+
+        if (treeElement) {
+          treeElement.focus();
+        }
+      }
+    }, []);
+
+    // Prefer the `style` prop over Emotion `css` for sizing so desktop `resize`
+    // is inspectable in tests and so xs can disable resize without !important.
+    // Height stays unset until the user drags the grip so the panel shrink-wraps
+    // the way the old max-height list did. A fixed height left a ~600px popover
+    // even when search returned one row.
+    const panelStyle: React.CSSProperties = isXsViewport
+      ? {
+          width: '100vw',
+          overflow: 'hidden',
+          display: 'flex',
+          flexDirection: 'column',
+          resize: 'none',
+        }
+      : {
+          width: userPanelSize?.width ?? DEFAULT_PANEL_WIDTH,
+          ...(userPanelSize ? { height: userPanelSize.height } : {}),
+          minWidth: 320,
+          minHeight: 240,
+          maxWidth: 'min(90vw, 800px)',
+          maxHeight: 'min(85vh, 800px)',
+          boxSizing: 'border-box',
+          resize: 'both',
+          overflow: 'hidden',
+          display: 'flex',
+          flexDirection: 'column',
+        };
+
+    // A JSX block containing the panel body rendered inside the popover.
+    const columnListPanel = (
+      <div
+        data-testid="column-selector-panel"
+        ref={panelRef}
+        style={panelStyle}
+        onPointerDown={onPanelResizePointerDown}
+      >
+        <div css={(theme) => ({ padding: theme.spacing.md, flex: '0 0 auto' })}>
+          <Input
+            componentId="codegen_mlflow_app_src_experiment-tracking_components_experiment-page_components_runs_experimentviewrunscolumnselector.tsx_300"
+            value={filter}
+            prefix={<SearchIcon />}
+            placeholder="Search columns"
+            allowClear
+            ref={searchInputRef}
+            onChange={(e) => {
+              setFilter(e.target.value);
+            }}
+            onKeyDown={searchInputKeyDown}
+          />
+        </div>
+        <div
+          ref={scrollableContainerRef}
+          data-testid="column-selector-list"
+          // Cap the shrink-wrapped list at 15 rows. After the user resizes the
+          // panel, drop the cap so the tree fills the dragged height.
+          style={isXsViewport || userPanelSize ? undefined : { maxHeight: DEFAULT_TREE_MAX_HEIGHT }}
+          css={{
+            flex: '1 1 auto',
+            minHeight: 0,
+            overflowY: 'auto',
+            overflowX: 'hidden',
+            paddingBottom: theme.spacing.md,
+            'span[title]': {
+              whiteSpace: 'nowrap',
+              textOverflow: 'ellipsis',
+              overflow: 'hidden',
+            },
+            ...(isXsViewport
+              ? {
+                  maxHeight: 'calc(100vh - 100px)',
+                }
+              : {}),
+          }}
+        >
+          <Tree
+            data-testid="column-selector-tree"
+            mode="checkable"
+            dangerouslySetAntdProps={{
+              checkedKeys: selectedColumns,
+              onCheck,
+            }}
+            defaultExpandedKeys={[GROUP_KEY_ATTRIBUTES, GROUP_KEY_PARAMS, GROUP_KEY_METRICS, GROUP_KEY_TAGS]}
+            treeData={treeData}
+          />
+        </div>
+        <div
+          css={{
+            borderTop: `1px solid ${theme.colors.border}`,
+            // Extra bottom/right padding keeps the native CSS resize grip clickable.
+            padding: theme.spacing.sm,
+            paddingRight: theme.spacing.lg,
+            paddingBottom: theme.spacing.md,
+            display: 'flex',
+            justifyContent: 'flex-end',
+            flex: '0 0 auto',
+          }}
+        >
+          <Button
+            componentId="mlflow.experiment_page.runs_table.column_selector.reset_to_defaults"
+            type="tertiary"
+            data-testid="column-selector-reset"
+            onClick={() => {
+              onResetColumns();
+              onChangeColumnSelectorVisible(false);
+            }}
+          >
+            <FormattedMessage
+              defaultMessage="Reset to defaults"
+              description="Button in the experiment runs table column selector that resets column visibility, order and width back to defaults"
+            />
+          </Button>
+        </div>
+      </div>
+    );
+
+    return (
+      <Popover.Root
+        componentId="mlflow.experiment_page.runs_table.column_selector"
+        open={columnSelectorVisible}
+        onOpenChange={onChangeColumnSelectorVisible}
+      >
+        <Popover.Trigger asChild>
+          <Button
+            componentId="codegen_mlflow_app_src_experiment-tracking_components_experiment-page_components_runs_experimentviewrunscolumnselector.tsx_315"
+            ref={buttonRef}
+            style={{ display: 'flex', alignItems: 'center' }}
+            data-testid="column-selection-dropdown"
+            icon={<ColumnsIcon />}
+          >
+            <FormattedMessage
+              defaultMessage="Columns"
+              description="Dropdown text to display columns names that could to be rendered for the experiment runs table"
+            />{' '}
+            <ChevronDownIcon />
+          </Button>
+        </Popover.Trigger>
+        <Popover.Content
+          align="start"
+          // The panel manages its own inner padding, so reset the popover's
+          // default padding via inline style (using `css` here would replace the
+          // design-system Content styles wholesale, dropping the surface/border).
+          style={{ padding: 0 }}
+          // Keep focus inside the search input rather than auto-focusing the
+          // popover container, matching the previous open behavior.
+          onOpenAutoFocus={(e) => e.preventDefault()}
+        >
+          {columnListPanel}
+        </Popover.Content>
+      </Popover.Root>
+    );
+  },
+);

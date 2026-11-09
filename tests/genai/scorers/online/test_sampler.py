@@ -1,0 +1,210 @@
+import json
+import uuid
+from unittest import mock
+
+import pytest
+
+from mlflow.genai import scorer
+from mlflow.genai.scorers.base import Scorer, ScorerStatus, _UnexecutedDecoratorScorer
+from mlflow.genai.scorers.builtin_scorers import Completeness, ConversationCompleteness
+from mlflow.genai.scorers.online.entities import OnlineScorer, OnlineScoringConfig
+from mlflow.genai.scorers.online.sampler import OnlineScorerSampler
+
+
+def make_online_scorer(
+    scorer,
+    sample_rate: float = 1.0,
+    filter_string: str | None = None,
+    scorer_version: int | None = None,
+) -> OnlineScorer:
+    return OnlineScorer(
+        name=scorer.name,
+        serialized_scorer=json.dumps(scorer.model_dump()),
+        online_config=OnlineScoringConfig(
+            online_scoring_config_id=uuid.uuid4().hex,
+            scorer_id=uuid.uuid4().hex,
+            sample_rate=sample_rate,
+            experiment_id="exp1",
+            filter_string=filter_string,
+        ),
+        scorer_version=scorer_version,
+    )
+
+
+def test_group_scorers_by_filter_empty():
+    sampler = OnlineScorerSampler([])
+
+    assert sampler.group_scorers_by_filter(session_level=False) == {}
+
+
+def test_group_scorers_preserves_registered_version():
+    sampler = OnlineScorerSampler([
+        make_online_scorer(
+            Completeness(),
+            sample_rate=0.5,
+            filter_string="tags.environment = 'production'",
+            scorer_version=4,
+        )
+    ])
+
+    scorers = sampler.group_scorers_by_filter(session_level=False)[
+        "tags.environment = 'production'"
+    ]
+
+    assert scorers[0].scorer_version == 4
+    assert scorers[0].sample_rate == 0.5
+    assert scorers[0].filter_string == "tags.environment = 'production'"
+    assert scorers[0].status == ScorerStatus.STARTED
+
+
+def test_group_scorers_by_filter_no_filters():
+    configs = [
+        make_online_scorer(Completeness()),
+        make_online_scorer(ConversationCompleteness()),
+    ]
+    sampler = OnlineScorerSampler(configs)
+
+    trace_groups = sampler.group_scorers_by_filter(session_level=False)
+    session_groups = sampler.group_scorers_by_filter(session_level=True)
+
+    assert set(trace_groups.keys()) == {None}
+    assert [s.name for s in trace_groups[None]] == ["completeness"]
+    assert set(session_groups.keys()) == {None}
+    assert [s.name for s in session_groups[None]] == ["conversation_completeness"]
+
+
+def test_group_scorers_by_filter_with_filters():
+    configs = [
+        make_online_scorer(Completeness(), filter_string="tags.env = 'prod'"),
+        make_online_scorer(Completeness(name="c2"), filter_string="tags.model = 'gpt-4'"),
+        make_online_scorer(Completeness(name="c3")),
+    ]
+    sampler = OnlineScorerSampler(configs)
+
+    result = sampler.group_scorers_by_filter(session_level=False)
+
+    assert set(result.keys()) == {None, "tags.env = 'prod'", "tags.model = 'gpt-4'"}
+    assert [s.name for s in result["tags.env = 'prod'"]] == ["completeness"]
+    assert [s.name for s in result["tags.model = 'gpt-4'"]] == ["c2"]
+    assert [s.name for s in result[None]] == ["c3"]
+
+
+def test_group_scorers_by_filter_multiple_scorers_same_filter():
+    configs = [
+        make_online_scorer(Completeness(), filter_string="tags.env = 'prod'"),
+        make_online_scorer(Completeness(name="c2"), filter_string="tags.env = 'prod'"),
+    ]
+    sampler = OnlineScorerSampler(configs)
+
+    result = sampler.group_scorers_by_filter(session_level=False)
+
+    assert set(result.keys()) == {"tags.env = 'prod'"}
+    assert len(result["tags.env = 'prod'"]) == 2
+
+
+def test_group_scorers_by_filter_session_level():
+    configs = [
+        make_online_scorer(Completeness()),
+        make_online_scorer(ConversationCompleteness()),
+    ]
+    sampler = OnlineScorerSampler(configs)
+
+    trace_groups = sampler.group_scorers_by_filter(session_level=False)
+    session_groups = sampler.group_scorers_by_filter(session_level=True)
+
+    assert [s.name for s in trace_groups[None]] == ["completeness"]
+    assert [s.name for s in session_groups[None]] == ["conversation_completeness"]
+
+
+def test_sample_all_selected_at_100_percent():
+    configs = [
+        make_online_scorer(Completeness(), sample_rate=1.0),
+        make_online_scorer(ConversationCompleteness(), sample_rate=1.0),
+    ]
+    sampler = OnlineScorerSampler(configs)
+    scorers = list(sampler._scorers.values())
+
+    result = sampler.sample("entity_123", scorers)
+
+    assert len(result) == 2
+
+
+def test_sample_none_selected_at_0_percent():
+    configs = [make_online_scorer(Completeness(), sample_rate=0.0)]
+    sampler = OnlineScorerSampler(configs)
+    scorers = list(sampler._scorers.values())
+
+    result = sampler.sample("entity_123", scorers)
+
+    assert result == []
+
+
+def test_sample_deterministic_by_entity_id():
+    configs = [make_online_scorer(Completeness(), sample_rate=0.5)]
+    sampler = OnlineScorerSampler(configs)
+    scorers = list(sampler._scorers.values())
+
+    results = [sampler.sample("same_entity", scorers) for _ in range(10)]
+
+    assert all(r == results[0] for r in results)
+
+
+@pytest.mark.parametrize("entity_id", [f"entity_{i}" for i in range(20)])
+def test_sample_dense_waterfall_behavior(entity_id):
+    high = Completeness(name="high")
+    medium = Completeness(name="medium")
+    low = Completeness(name="low")
+    configs = [
+        make_online_scorer(high, sample_rate=0.8),
+        make_online_scorer(medium, sample_rate=0.5),
+        make_online_scorer(low, sample_rate=0.2),
+    ]
+    sampler = OnlineScorerSampler(configs)
+    scorers = [sampler._scorers["high"], sampler._scorers["medium"], sampler._scorers["low"]]
+
+    result = sampler.sample(entity_id, scorers)
+
+    result_names = [s.name for s in result]
+    if "high" not in result_names:
+        assert "medium" not in result_names
+        assert "low" not in result_names
+    if "medium" not in result_names and "high" in result_names:
+        assert "low" not in result_names
+
+
+def _custom_scorer():
+    @scorer
+    def output_length(outputs) -> int:
+        return len(str(outputs))
+
+    return output_length
+
+
+def test_custom_scorer_is_loaded_without_running_its_code_when_it_runs_in_a_container():
+    configs = [make_online_scorer(_custom_scorer()), make_online_scorer(Completeness())]
+    with mock.patch.object(
+        Scorer, "_reconstruct_decorator_scorer", side_effect=AssertionError("ran scorer code")
+    ):
+        sampler = OnlineScorerSampler(configs, run_custom_scorers_on_host=False)
+
+    scorers = sampler.group_scorers_by_filter(session_level=False)[None]
+    assert [type(s) for s in scorers] == [_UnexecutedDecoratorScorer, Completeness]
+    assert sampler.online_scorer("output_length") is configs[0]
+    assert sampler.scorer("output_length") is scorers[0]
+
+
+def test_custom_scorer_ensemble_is_skipped_when_custom_scorers_run_in_a_container():
+    custom = make_online_scorer(_custom_scorer())
+    ensemble_data = {
+        "name": "ensemble",
+        "ensemble_scorer_data": {"scorers": [json.loads(custom.serialized_scorer)]},
+    }
+    ensemble = OnlineScorer(
+        name="ensemble",
+        serialized_scorer=json.dumps(ensemble_data),
+        online_config=custom.online_config,
+    )
+
+    sampler = OnlineScorerSampler([ensemble], run_custom_scorers_on_host=False)
+
+    assert sampler.group_scorers_by_filter(session_level=False) == {}
